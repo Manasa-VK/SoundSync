@@ -1,4 +1,4 @@
-// server.js - WebSocket server for synced speakers
+// server.js - WebSocket server for synced speakers with MP3 support
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -21,17 +21,12 @@ const server = http.createServer((req, res) => {
     res.writeHead(404);
     res.end('Not found');
   }
-  
-  // Handle large messages
-  req.on('error', (err) => {
-    console.error('Request error:', err);
-  });
 });
 
-// Create WebSocket server with increased max message size
+// Create WebSocket server with increased message size limit for MP3 files
 const wss = new WebSocket.Server({ 
-  server,
-  maxPayload: 50 * 1024 * 1024  // 50MB max payload size for audio files
+  server, 
+  maxPayload: 50 * 1024 * 1024  // 50MB max payload size
 });
 
 // Keep track of all connected clients
@@ -88,9 +83,16 @@ wss.on('connection', (ws) => {
           // Add server timestamp for synchronization
           data.serverTime = Date.now();
           
+          // Log MP3 data size if present
+          if (data.mp3Data) {
+            const sizeInMB = (data.mp3Data.length * 0.75) / (1024 * 1024);
+            console.log(`Broadcasting audio file (${sizeInMB.toFixed(2)}MB)`);
+          } else {
+            console.log('Broadcasting test sound');
+          }
+          
           // Broadcast the play command to all clients except the host
           broadcastToClients(JSON.stringify(data), true);
-          console.log('Broadcasting play command');
           break;
           
         case 'stop':

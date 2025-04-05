@@ -150,6 +150,32 @@
             width: 100%;
             height: 100%;
         }
+        .progress-bar {
+            width: 100%;
+            background-color: #333;
+            height: 20px;
+            border-radius: 10px;
+            margin-top: 10px;
+            position: relative;
+            overflow: hidden;
+            display: none;
+        }
+        .progress-fill {
+            height: 100%;
+            background-color: #1db954;
+            width: 0%;
+            transition: width 0.3s;
+        }
+        .progress-text {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            line-height: 20px;
+            text-align: center;
+            font-size: 12px;
+            color: white;
+        }
     </style>
 </head>
 <body>
@@ -183,6 +209,11 @@
             <input type="file" id="audio-file" class="file-input" accept="audio/*">
             <div id="selected-file">No file selected</div>
             
+            <div id="upload-progress" class="progress-bar">
+                <div id="progress-fill" class="progress-fill"></div>
+                <div id="progress-text" class="progress-text">0%</div>
+            </div>
+            
             <button id="play-btn" disabled>Play on All Devices</button>
             <button id="stop-btn" disabled>Stop</button>
             
@@ -204,6 +235,8 @@
         let visualizerCanvas = document.getElementById('visualization-canvas');
         let canvasCtx = visualizerCanvas.getContext('2d');
         let isPlaying = false;
+        let audioArrayBuffer = null;
+        let audioFile = null;
         
         // Elements
         const hostBtn = document.getElementById('host-btn');
@@ -219,6 +252,9 @@
         const audioFileInput = document.getElementById('audio-file');
         const selectedFile = document.getElementById('selected-file');
         const devicesList = document.getElementById('devices-list');
+        const uploadProgress = document.getElementById('upload-progress');
+        const progressFill = document.getElementById('progress-fill');
+        const progressText = document.getElementById('progress-text');
         
         // Initialize audio context
         function initAudio() {
@@ -281,9 +317,9 @@
             };
             
             socket.onmessage = function(event) {
-                console.log('Message received:', event.data);
                 try {
                     const message = JSON.parse(event.data);
+                    console.log('Message received:', message.type);
                     
                     switch (message.type) {
                         case 'host-confirmed':
@@ -310,7 +346,11 @@
                             
                         case 'play':
                             if (!isHost) {
-                                playTestTone();
+                                if (message.mp3Data) {
+                                    playMP3FromBase64(message.mp3Data);
+                                } else {
+                                    playTestTone();
+                                }
                             }
                             break;
                             
@@ -391,6 +431,48 @@
             }, 2000);
         }
         
+        // Play MP3 from base64 string
+        function playMP3FromBase64(base64Data) {
+            if (!audioContext) {
+                initAudio();
+            }
+            
+            stopAudio();
+            
+            // Convert base64 to array buffer
+            const binaryString = atob(base64Data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            // Decode the audio data
+            audioContext.decodeAudioData(bytes.buffer, function(buffer) {
+                // Create a source node from the buffer
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                
+                // Connect the source to the gain node
+                source.connect(gainNode);
+                
+                // Start playback
+                source.start(0);
+                audioSource = source;
+                isPlaying = true;
+                
+                // Start visualizer
+                drawVisualizer();
+                
+                // Handle when playback ends
+                source.onended = function() {
+                    stopAudio();
+                };
+            }, function(error) {
+                console.error('Error decoding audio data:', error);
+                playTestTone(); // Fallback to test tone
+            });
+        }
+        
         // Stop audio playback
         function stopAudio() {
             if (audioSource) {
@@ -435,6 +517,16 @@
             }
         }
         
+        // Convert an ArrayBuffer to a Base64 string
+        function arrayBufferToBase64(buffer) {
+            const binary = [];
+            const bytes = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary.push(String.fromCharCode(bytes[i]));
+            }
+            return btoa(binary.join(''));
+        }
+        
         // Event listeners
         hostBtn.addEventListener('click', () => {
             if (initAudio()) {
@@ -462,14 +554,43 @@
         });
         
         playBtn.addEventListener('click', () => {
-            if (!isHost || !socket) return;
+            if (!isHost || !socket || !audioArrayBuffer) return;
             
+            // Convert the audio file to a base64 string
+            const base64Data = arrayBufferToBase64(audioArrayBuffer);
+            
+            // Send the MP3 data to all clients
             const message = {
-                type: 'play'
+                type: 'play',
+                mp3Data: base64Data
             };
             
+            // Show upload progress
+            uploadProgress.style.display = 'block';
+            progressFill.style.width = '0%';
+            progressText.textContent = '0%';
+            
+            // Split the data into chunks for larger files
+            const chunkSize = 50000; // 50KB chunks
+            const chunks = Math.ceil(base64Data.length / chunkSize);
+            
+            // Function to update progress bar
+            function updateProgress(current, total) {
+                const percent = Math.round((current / total) * 100);
+                progressFill.style.width = `${percent}%`;
+                progressText.textContent = `${percent}%`;
+            }
+            
+            // Send the message
             socket.send(JSON.stringify(message));
-            playTestTone();
+            
+            // Play on host device
+            playMP3FromBase64(base64Data);
+            
+            // Hide progress bar after a delay
+            setTimeout(() => {
+                uploadProgress.style.display = 'none';
+            }, 1000);
         });
         
         stopBtn.addEventListener('click', () => {
@@ -487,8 +608,15 @@
             const file = event.target.files[0];
             if (file) {
                 selectedFile.textContent = file.name;
-                playBtn.disabled = false;
-                stopBtn.disabled = false;
+                
+                // Read the file as an ArrayBuffer
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    audioArrayBuffer = e.target.result;
+                    playBtn.disabled = false;
+                    stopBtn.disabled = false;
+                };
+                reader.readAsArrayBuffer(file);
             }
         });
         
