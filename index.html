@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Sync Speakers</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #121212;
+            color: #ffffff;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            text-align: center;
+        }
+        .container {
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            max-width: 500px;
+            width: 90%;
+        }
+        h1 {
+            margin-top: 0;
+            color: #1db954;
+            font-size: 28px;
+        }
+        .status {
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            font-size: 16px;
+        }
+        .status-text {
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .connected {
+            color: #1db954;
+        }
+        .connecting {
+            color: #ffbc4b;
+        }
+        .disconnected {
+            color: #ff5555;
+        }
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            margin-top: 25px;
+        }
+        button {
+            background-color: #1db954;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 50px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.2s;
+        }
+        button:hover {
+            background-color: #1ed760;
+            transform: translateY(-2px);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        button:disabled {
+            background-color: #4d4d4d;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .host-controls {
+            display: none;
+            margin-top: 20px;
+            border-top: 1px solid #333;
+            padding-top: 20px;
+        }
+        .file-input {
+            display: none;
+        }
+        .file-label {
+            background-color: #333;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 50px;
+            font-size: 16px;
+            cursor: pointer;
+            display: inline-block;
+            margin-bottom: 15px;
+        }
+        .devices-list {
+            background-color: #2a2a2a;
+            border-radius: 8px;
+            padding: 10px;
+            margin-top: 15px;
+            text-align: left;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        .device-item {
+            padding: 8px;
+            border-bottom: 1px solid #333;
+        }
+        .device-item:last-child {
+            border-bottom: none;
+        }
+        .volume-control {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin: 15px 0;
+        }
+        input[type="range"] {
+            width: 80%;
+            -webkit-appearance: none;
+            height: 5px;
+            border-radius: 5px;
+            background: #333;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #1db954;
+            cursor: pointer;
+        }
+        .visualizer {
+            height: 60px;
+            width: 100%;
+            background-color: #2a2a2a;
+            border-radius: 8px;
+            margin-top: 15px;
+            overflow: hidden;
+        }
+        #visualization-canvas {
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Network Sync Speakers</h1>
+        
+        <div class="status">
+            <div class="status-text">Status: <span id="connection-status" class="connecting">Initializing...</span></div>
+            <div id="sync-info">Searching for other devices on the network...</div>
+        </div>
+        
+        <div class="volume-control">
+            <span>Volume:</span>
+            <input type="range" id="volume-slider" min="0" max="1" step="0.01" value="0.7">
+            <span id="volume-value">70%</span>
+        </div>
+        
+        <div class="visualizer">
+            <canvas id="visualization-canvas"></canvas>
+        </div>
+        
+        <div class="controls">
+            <button id="host-btn">Become Host</button>
+            <button id="join-btn">Join Existing Session</button>
+            <button id="test-btn" disabled>Test Sound</button>
+        </div>
+        
+        <div id="host-controls" class="host-controls">
+            <h2>Host Controls</h2>
+            <label for="audio-file" class="file-label">Choose Audio File</label>
+            <input type="file" id="audio-file" class="file-input" accept="audio/*">
+            <div id="selected-file">No file selected</div>
+            
+            <button id="play-btn" disabled>Play on All Devices</button>
+            <button id="stop-btn" disabled>Stop</button>
+            
+            <h3>Connected Devices</h3>
+            <div id="devices-list" class="devices-list">
+                <div class="device-item">This device (Host)</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Main variables
+        let isHost = false;
+        let socket = null;
+        let audioContext = null;
+        let gainNode = null;
+        let audioSource = null;
+        let analyzer = null;
+        let audioBuffer = null;
+        let startTime = 0;
+        let visualizerCanvas = document.getElementById('visualization-canvas');
+        let canvasCtx = visualizerCanvas.getContext('2d');
+        let isPlaying = false;
+        
+        // Elements
+        const hostBtn = document.getElementById('host-btn');
+        const joinBtn = document.getElementById('join-btn');
+        const testBtn = document.getElementById('test-btn');
+        const playBtn = document.getElementById('play-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const hostControls = document.getElementById('host-controls');
+        const connectionStatus = document.getElementById('connection-status');
+        const syncInfo = document.getElementById('sync-info');
+        const volumeSlider = document.getElementById('volume-slider');
+        const volumeValue = document.getElementById('volume-value');
+        const audioFileInput = document.getElementById('audio-file');
+        const selectedFile = document.getElementById('selected-file');
+        const devicesList = document.getElementById('devices-list');
+        
+        // Initialize audio context
+        function initAudio() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                gainNode = audioContext.createGain();
+                analyzer = audioContext.createAnalyser();
+                analyzer.fftSize = 256;
+                
+                gainNode.connect(analyzer);
+                analyzer.connect(audioContext.destination);
+                
+                // Set initial volume
+                gainNode.gain.value = volumeSlider.value;
+                
+                // Enable test button
+                testBtn.disabled = false;
+                
+                return true;
+            } catch (error) {
+                console.error('Web Audio API not supported:', error);
+                connectionStatus.textContent = 'Audio not supported on this browser';
+                connectionStatus.className = 'disconnected';
+                return false;
+            }
+        }
+        
+        // Setup WebSocket connection
+        function setupConnection(isHosting) {
+            isHost = isHosting;
+            
+            // Get current hostname and port for WebSocket connection
+            const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            const wsUrl = `${protocol}${window.location.host}`;
+            
+            socket = new WebSocket(wsUrl);
+            
+            socket.onopen = function() {
+                console.log('WebSocket connection established');
+                
+                if (isHost) {
+                    // Register as host
+                    socket.send(JSON.stringify({
+                        type: 'host'
+                    }));
+                    
+                    hostControls.style.display = 'block';
+                    connectionStatus.textContent = 'Hosting Active';
+                    connectionStatus.className = 'connected';
+                    syncInfo.textContent = 'Share this page URL with others on your network to join';
+                } else {
+                    // Register as client
+                    socket.send(JSON.stringify({
+                        type: 'join',
+                        deviceName: `Device_${Math.floor(Math.random() * 10000)}`
+                    }));
+                }
+            };
+            
+            socket.onmessage = function(event) {
+                const message = JSON.parse(event.data);
+                
+                switch (message.type) {
+                    case 'host-confirmed':
+                        console.log(`Host confirmed. ${message.clientCount} clients connected`);
+                        break;
+                        
+                    case 'join-confirmed':
+                        connectionStatus.textContent = 'Connected to Session';
+                        connectionStatus.className = 'connected';
+                        syncInfo.textContent = 'Ready to play synchronized audio';
+                        break;
+                        
+                    case 'client-joined':
+                        if (isHost) {
+                            addDeviceToList(message.deviceName);
+                        }
+                        break;
+                        
+                    case 'client-left':
+                        if (isHost) {
+                            removeDeviceFromList(message.deviceName);
+                        }
+                        break;
+                        
+                    case 'play':
+                        if (!isHost) {
+                            playAudioWithSync(message.audioData, message.serverTime, message.clientTime);
+                        }
+                        break;
+                        
+                    case 'stop':
+                        if (!isHost) {
+                            stopAudio();
+                        }
+                        break;
+                }
+            };
+            
+            socket.onclose = function() {
+                connectionStatus.textContent = 'Disconnected';
+                connectionStatus.className = 'disconnected';
+                syncInfo.textContent = 'Connection lost. Please refresh the page.';
+            };
+            
+            socket.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                connectionStatus.textContent = 'Connection Error';
+                connectionStatus.className = 'disconnected';
+                syncInfo.textContent = 'Could not connect to the server.';
+            };
+            
+            // Disable setup buttons
+            hostBtn.disabled = true;
+            joinBtn.disabled = true;
+        }
+        
+        // Add a device to the list (host only)
+        function addDeviceToList(deviceName) {
+            const deviceItem = document.createElement('div');
+            deviceItem.className = 'device-item';
+            deviceItem.textContent = deviceName;
+            deviceItem.setAttribute('data-device', deviceName);
+            devicesList.appendChild(deviceItem);
+        }
+        
+        // Remove a device from the list (host only)
+        function removeDeviceFromList(deviceName) {
+            const deviceItem = document.querySelector(`[data-device="${deviceName}"]`);
+            if (deviceItem) {
+                deviceItem.remove();
+            }
+        }
+        
+        // Play audio with synchronization
+        function playAudioWithSync(audioData, serverTime, clientTime) {
+            if (!audioContext) {
+                initAudio();
+            }
+            
+            // Calculate network latency
+            const clientNow = Date.now();
+            const latency = (clientNow - clientTime) / 2;
+            
+            // Decode audio data
+            if (audioData) {
+                // In a real implementation, you would receive the actual audio data
+                // For this demo, we'll generate a test tone
+                playTestTone();
+            } else {
+                playTestTone();
+            }
+        }
+        
+        // Play a test tone
+        function playTestTone() {
+            if (!audioContext) {
+                initAudio();
+            }
+            
+            stopAudio();
+            
+            // Create oscillator for a test tone
+            const oscillator = audioContext.createOscillator();
+            oscillator.type = 'sine';
+            oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // A4 note
+            
+            oscillator.connect(gainNode);
+            oscillator.start();
+            oscillator.stop(audioContext.currentTime + 2); // Play for 2 seconds
+            
+            audioSource = oscillator;
+            isPlaying = true;
+            
+            // Start visualizer
+            drawVisualizer();
+            
+            // Auto-stop
+            setTimeout(() => {
+                if (isPlaying) {
+                    stopAudio();
+                }
+            }, 2000);
+        }
+        
+        // Stop audio playback
+        function stopAudio() {
+            if (audioSource) {
+                try {
+                    audioSource.stop();
+                } catch (e) {
+                    // Already stopped
+                }
+                audioSource = null;
+            }
+            isPlaying = false;
+        }
+        
+        // Draw audio visualizer
+        function drawVisualizer() {
+            if (!isPlaying) return;
+            
+            requestAnimationFrame(drawVisualizer);
+            
+            const bufferLength = analyzer.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyzer.getByteFrequencyData(dataArray);
+            
+            // Clear canvas
+            canvasCtx.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
+            
+            const barWidth = (visualizerCanvas.width / bufferLength) * 2.5;
+            let x = 0;
+            
+            for (let i = 0; i < bufferLength; i++) {
+                const barHeight = dataArray[i] / 255 * visualizerCanvas.height;
+                
+                // Use gradient color
+                const gradient = canvasCtx.createLinearGradient(0, 0, 0, visualizerCanvas.height);
+                gradient.addColorStop(0, '#1db954');
+                gradient.addColorStop(1, '#135e2a');
+                
+                canvasCtx.fillStyle = gradient;
+                canvasCtx.fillRect(x, visualizerCanvas.height - barHeight, barWidth, barHeight);
+                
+                x += barWidth + 1;
+            }
+        }
+        
+        // Event listeners
+        hostBtn.addEventListener('click', () => {
+            if (initAudio()) {
+                setupConnection(true);
+            }
+        });
+        
+        joinBtn.addEventListener('click', () => {
+            if (initAudio()) {
+                setupConnection(false);
+            }
+        });
+        
+        testBtn.addEventListener('click', () => {
+            playTestTone();
+        });
+        
+        playBtn.addEventListener('click', () => {
+            if (!isHost || !socket) return;
+            
+            const message = {
+                type: 'play',
+                clientTime: Date.now()
+            };
+            
+            socket.send(JSON.stringify(message));
+            playTestTone();
+        });
+        
+        stopBtn.addEventListener('click', () => {
+            if (!isHost || !socket) return;
+            
+            const message = {
+                type: 'stop'
+            };
+            
+            socket.send(JSON.stringify(message));
+            stopAudio();
+        });
+        
+        volumeSlider.addEventListener('input', () => {
+            if (gainNode) {
+                gainNode.gain.value = volumeSlider.value;
+                volumeValue.textContent = `${Math.round(volumeSlider.value * 100)}%`;
+            }
+        });
+        
+        audioFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                selectedFile.textContent = file.name;
+                playBtn.disabled = false;
+                stopBtn.disabled = false;
+                
+                // In a real implementation, you would load and process the audio file
+                // For this demo, we'll just enable the play button
+            }
+        });
+        
+        // Make canvas responsive
+        function resizeCanvas() {
+            visualizerCanvas.width = visualizerCanvas.offsetWidth;
+            visualizerCanvas.height = visualizerCanvas.offsetHeight;
+        }
+        
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        
+        // Initialize
+        window.addEventListener('load', () => {
+            // Check if Web Audio API is supported
+            if (window.AudioContext || window.webkitAudioContext) {
+                connectionStatus.textContent = 'Ready to Connect';
+                connectionStatus.className = 'connecting';
+                syncInfo.textContent = 'Choose to host or join a session';
+            } else {
+                connectionStatus.textContent = 'Audio not supported';
+                connectionStatus.className = 'disconnected';
+                syncInfo.textContent = 'Your browser does not support Web Audio API';
+                
+                hostBtn.disabled = true;
+                joinBtn.disabled = true;
+                testBtn.disabled = true;
+            }
+        });
+    </script>
+</body>
+</html>
