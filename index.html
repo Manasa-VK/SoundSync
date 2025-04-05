@@ -201,8 +201,6 @@
         let gainNode = null;
         let audioSource = null;
         let analyzer = null;
-        let audioBuffer = null;
-        let startTime = 0;
         let visualizerCanvas = document.getElementById('visualization-canvas');
         let canvasCtx = visualizerCanvas.getContext('2d');
         let isPlaying = false;
@@ -252,9 +250,11 @@
         function setupConnection(isHosting) {
             isHost = isHosting;
             
-            // Get current hostname and port for WebSocket connection
+            // Get WebSocket URL based on current page URL
             const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
             const wsUrl = `${protocol}${window.location.host}`;
+            
+            console.log('Connecting to WebSocket at:', wsUrl);
             
             socket = new WebSocket(wsUrl);
             
@@ -281,42 +281,47 @@
             };
             
             socket.onmessage = function(event) {
-                const message = JSON.parse(event.data);
-                
-                switch (message.type) {
-                    case 'host-confirmed':
-                        console.log(`Host confirmed. ${message.clientCount} clients connected`);
-                        break;
-                        
-                    case 'join-confirmed':
-                        connectionStatus.textContent = 'Connected to Session';
-                        connectionStatus.className = 'connected';
-                        syncInfo.textContent = 'Ready to play synchronized audio';
-                        break;
-                        
-                    case 'client-joined':
-                        if (isHost) {
-                            addDeviceToList(message.deviceName);
-                        }
-                        break;
-                        
-                    case 'client-left':
-                        if (isHost) {
-                            removeDeviceFromList(message.deviceName);
-                        }
-                        break;
-                        
-                    case 'play':
-                        if (!isHost) {
-                            playAudioWithSync(message.audioData, message.serverTime, message.clientTime);
-                        }
-                        break;
-                        
-                    case 'stop':
-                        if (!isHost) {
-                            stopAudio();
-                        }
-                        break;
+                console.log('Message received:', event.data);
+                try {
+                    const message = JSON.parse(event.data);
+                    
+                    switch (message.type) {
+                        case 'host-confirmed':
+                            console.log(`Host confirmed. ${message.clientCount} clients connected`);
+                            break;
+                            
+                        case 'join-confirmed':
+                            connectionStatus.textContent = 'Connected to Session';
+                            connectionStatus.className = 'connected';
+                            syncInfo.textContent = 'Ready to play synchronized audio';
+                            break;
+                            
+                        case 'client-joined':
+                            if (isHost) {
+                                addDeviceToList(message.deviceName);
+                            }
+                            break;
+                            
+                        case 'client-left':
+                            if (isHost) {
+                                removeDeviceFromList(message.deviceName);
+                            }
+                            break;
+                            
+                        case 'play':
+                            if (!isHost) {
+                                playTestTone();
+                            }
+                            break;
+                            
+                        case 'stop':
+                            if (!isHost) {
+                                stopAudio();
+                            }
+                            break;
+                    }
+                } catch (error) {
+                    console.error('Error parsing message:', error);
                 }
             };
             
@@ -352,26 +357,6 @@
             const deviceItem = document.querySelector(`[data-device="${deviceName}"]`);
             if (deviceItem) {
                 deviceItem.remove();
-            }
-        }
-        
-        // Play audio with synchronization
-        function playAudioWithSync(audioData, serverTime, clientTime) {
-            if (!audioContext) {
-                initAudio();
-            }
-            
-            // Calculate network latency
-            const clientNow = Date.now();
-            const latency = (clientNow - clientTime) / 2;
-            
-            // Decode audio data
-            if (audioData) {
-                // In a real implementation, you would receive the actual audio data
-                // For this demo, we'll generate a test tone
-                playTestTone();
-            } else {
-                playTestTone();
             }
         }
         
@@ -465,14 +450,22 @@
         
         testBtn.addEventListener('click', () => {
             playTestTone();
+            
+            // Also send test sound command to all other devices if we're the host
+            if (isHost && socket) {
+                const message = {
+                    type: 'play'
+                };
+                
+                socket.send(JSON.stringify(message));
+            }
         });
         
         playBtn.addEventListener('click', () => {
             if (!isHost || !socket) return;
             
             const message = {
-                type: 'play',
-                clientTime: Date.now()
+                type: 'play'
             };
             
             socket.send(JSON.stringify(message));
@@ -490,22 +483,19 @@
             stopAudio();
         });
         
-        volumeSlider.addEventListener('input', () => {
-            if (gainNode) {
-                gainNode.gain.value = volumeSlider.value;
-                volumeValue.textContent = `${Math.round(volumeSlider.value * 100)}%`;
-            }
-        });
-        
         audioFileInput.addEventListener('change', (event) => {
             const file = event.target.files[0];
             if (file) {
                 selectedFile.textContent = file.name;
                 playBtn.disabled = false;
                 stopBtn.disabled = false;
-                
-                // In a real implementation, you would load and process the audio file
-                // For this demo, we'll just enable the play button
+            }
+        });
+        
+        volumeSlider.addEventListener('input', () => {
+            if (gainNode) {
+                gainNode.gain.value = volumeSlider.value;
+                volumeValue.textContent = `${Math.round(volumeSlider.value * 100)}%`;
             }
         });
         
