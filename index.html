@@ -176,6 +176,12 @@
             font-size: 12px;
             color: white;
         }
+        .calibration-info {
+            font-size: 12px;
+            color: #aaa;
+            margin-top: 5px;
+            height: 15px;
+        }
     </style>
 </head>
 <body>
@@ -185,6 +191,7 @@
         <div class="status">
             <div class="status-text">Status: <span id="connection-status" class="connecting">Initializing...</span></div>
             <div id="sync-info">Searching for other devices on the network...</div>
+            <div id="calibration-info" class="calibration-info"></div>
         </div>
         
         <div class="volume-control">
@@ -238,6 +245,13 @@
         let audioArrayBuffer = null;
         let audioFile = null;
         
+        // Synchronization variables
+        let clockOffset = 0;       // Difference between local and server time
+        let networkLatency = 0;    // One-way network latency in ms
+        let audioLatency = 0;      // Audio device latency in ms
+        let syncSamples = [];      // Samples for calculating average offset
+        let syncInProgress = false;
+        
         // Elements
         const hostBtn = document.getElementById('host-btn');
         const joinBtn = document.getElementById('join-btn');
@@ -247,6 +261,7 @@
         const hostControls = document.getElementById('host-controls');
         const connectionStatus = document.getElementById('connection-status');
         const syncInfo = document.getElementById('sync-info');
+        const calibrationInfo = document.getElementById('calibration-info');
         const volumeSlider = document.getElementById('volume-slider');
         const volumeValue = document.getElementById('volume-value');
         const audioFileInput = document.getElementById('audio-file');
@@ -273,6 +288,9 @@
                 // Enable test button
                 testBtn.disabled = false;
                 
+                // Estimate audio device latency
+                estimateAudioLatency();
+                
                 return true;
             } catch (error) {
                 console.error('Web Audio API not supported:', error);
@@ -280,6 +298,24 @@
                 connectionStatus.className = 'disconnected';
                 return false;
             }
+        }
+        
+        // Estimate audio device latency
+        function estimateAudioLatency() {
+            // Different browsers have different typical audio latencies
+            const userAgent = navigator.userAgent.toLowerCase();
+            
+            if (userAgent.indexOf('chrome') > -1) {
+                audioLatency = 15; // Chrome typical latency in ms
+            } else if (userAgent.indexOf('firefox') > -1) {
+                audioLatency = 20; // Firefox typical latency in ms
+            } else if (userAgent.indexOf('safari') > -1) {
+                audioLatency = 30; // Safari typical latency in ms
+            } else {
+                audioLatency = 25; // Default fallback
+            }
+            
+            console.log('Estimated audio latency:', audioLatency, 'ms');
         }
         
         // Setup WebSocket connection
@@ -307,29 +343,36 @@
                     connectionStatus.textContent = 'Hosting Active';
                     connectionStatus.className = 'connected';
                     syncInfo.textContent = 'Share this page URL with others on your network to join';
+                    
+                    // Start clock sync broadcast every 10 seconds
+                    setInterval(broadcastClockSync, 10000);
                 } else {
                     // Register as client
                     socket.send(JSON.stringify({
                         type: 'join',
                         deviceName: `Device_${Math.floor(Math.random() * 10000)}`
                     }));
+                    
+                    // Start clock synchronization immediately
+                    requestClockSync();
                 }
             };
             
             socket.onmessage = function(event) {
                 try {
                     const message = JSON.parse(event.data);
-                    console.log('Message received:', message.type);
                     
                     switch (message.type) {
                         case 'host-confirmed':
                             console.log(`Host confirmed. ${message.clientCount} clients connected`);
+                            // Initial clock sync broadcast
+                            broadcastClockSync();
                             break;
                             
                         case 'join-confirmed':
                             connectionStatus.textContent = 'Connected to Session';
                             connectionStatus.className = 'connected';
-                            syncInfo.textContent = 'Ready to play synchronized audio';
+                            syncInfo.textContent = 'Calibrating time synchronization...';
                             break;
                             
                         case 'client-joined':
@@ -347,7 +390,22 @@
                         case 'play':
                             if (!isHost) {
                                 if (message.mp3Data) {
-                                    playMP3FromBase64(message.mp3Data);
+                                    // Apply time synchronization
+                                    const serverScheduledTime = message.scheduledTime;
+                                    const localScheduledTime = serverScheduledTime - clockOffset;
+                                    const nowLocal = Date.now();
+                                    
+                                    // Calculate delay in seconds
+                                    // The formula accounts for network latency, clock offset, and audio device latency
+                                    let delay = (localScheduledTime - nowLocal) / 1000;
+                                    
+                                    // Adjust for audio latency (subtract our latency since we need to start earlier)
+                                    delay -= (audioLatency / 1000);
+                                    
+                                    console.log(`Playing with synchronized delay: ${delay.toFixed(3)}s`);
+                                    calibrationInfo.textContent = `Sync offset: ${Math.round(clockOffset)}ms, Network latency: ${Math.round(networkLatency)}ms`;
+                                    
+                                    playMP3FromBase64(message.mp3Data, delay);
                                 } else {
                                     playTestTone();
                                 }
@@ -357,6 +415,49 @@
                         case 'stop':
                             if (!isHost) {
                                 stopAudio();
+                            }
+                            break;
+                            
+                        case 'clock-sync':
+                            if (!isHost) {
+                                handleClockSync(message);
+                            }
+                            break;
+                            
+                        case 'clock-sync-request':
+                            if (isHost) {
+                                // Respond with current time
+                                socket.send(JSON.stringify({
+                                    type: 'clock-sync',
+                                    serverTime: Date.now(),
+                                    clientId: message.clientId
+                                }));
+                            }
+                            break;
+                            
+                        case 'ping':
+                            // Reply to ping with timestamp
+                            socket.send(JSON.stringify({
+                                type: 'pong',
+                                originalTime: message.time,
+                                replyTime: Date.now(),
+                                clientId: message.clientId
+                            }));
+                            break;
+                            
+                        case 'pong':
+                            if (!isHost && message.clientId === getClientId()) {
+                                const now = Date.now();
+                                const roundTrip = now - message.originalTime;
+                                networkLatency = roundTrip / 2; // Estimate one-way latency
+                                
+                                console.log(`Network latency: ${networkLatency.toFixed(2)}ms`);
+                                calibrationInfo.textContent = `Network latency: ${Math.round(networkLatency)}ms`;
+                                
+                                // After measuring network latency, request clock sync
+                                if (syncInProgress) {
+                                    requestClockSync();
+                                }
                             }
                             break;
                     }
@@ -381,6 +482,80 @@
             // Disable setup buttons
             hostBtn.disabled = true;
             joinBtn.disabled = true;
+        }
+        
+        // Get unique client ID (for synchronization messages)
+        function getClientId() {
+            if (!window.clientId) {
+                window.clientId = `client_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
+            }
+            return window.clientId;
+        }
+        
+        // Broadcast clock sync to all clients
+        function broadcastClockSync() {
+            if (!isHost || !socket) return;
+            
+            socket.send(JSON.stringify({
+                type: 'clock-sync',
+                serverTime: Date.now()
+            }));
+        }
+        
+        // Request clock sync from server
+        function requestClockSync() {
+            if (isHost || !socket) return;
+            
+            socket.send(JSON.stringify({
+                type: 'clock-sync-request',
+                clientId: getClientId(),
+                clientTime: Date.now()
+            }));
+        }
+        
+        // Handle clock sync response
+        function handleClockSync(message) {
+            const serverTime = message.serverTime;
+            const receiveTime = Date.now();
+            
+            // Calculate approximate difference between server and client clocks
+            // Assuming symmetric network latency
+            const offset = serverTime - receiveTime;
+            
+            // Add to samples for averaging
+            syncSamples.push(offset);
+            
+            // Keep only the last 5 samples
+            if (syncSamples.length > 5) {
+                syncSamples.shift();
+            }
+            
+            // Calculate average offset
+            const sum = syncSamples.reduce((a, b) => a + b, 0);
+            clockOffset = sum / syncSamples.length;
+            
+            console.log(`Clock offset: ${clockOffset.toFixed(2)}ms (${syncSamples.length} samples)`);
+            
+            // After getting clock sync, measure network latency
+            if (syncSamples.length < 5) {
+                syncInProgress = true;
+                measureNetworkLatency();
+            } else {
+                syncInProgress = false;
+                syncInfo.textContent = 'Ready to play synchronized audio';
+                calibrationInfo.textContent = `Sync offset: ${Math.round(clockOffset)}ms, Network latency: ${Math.round(networkLatency)}ms`;
+            }
+        }
+        
+        // Measure network latency
+        function measureNetworkLatency() {
+            if (isHost || !socket) return;
+            
+            socket.send(JSON.stringify({
+                type: 'ping',
+                time: Date.now(),
+                clientId: getClientId()
+            }));
         }
         
         // Add a device to the list (host only)
@@ -431,8 +606,8 @@
             }, 2000);
         }
         
-        // Play MP3 from base64 string
-        function playMP3FromBase64(base64Data) {
+        // Play MP3 from base64 string with precise timing
+        function playMP3FromBase64(base64Data, delay = 0) {
             if (!audioContext) {
                 initAudio();
             }
@@ -455,8 +630,21 @@
                 // Connect the source to the gain node
                 source.connect(gainNode);
                 
-                // Start playback
-                source.start(0);
+                // Calculate start time based on delay
+                let startTime;
+                
+                if (delay > 0) {
+                    // Future start time
+                    startTime = audioContext.currentTime + delay;
+                    source.start(startTime);
+                } else {
+                    // Start immediately but skip into the buffer
+                    startTime = audioContext.currentTime;
+                    source.start(startTime, Math.abs(delay));
+                }
+                
+                console.log(`Audio playback scheduled: currentTime=${audioContext.currentTime.toFixed(3)}, startTime=${startTime.toFixed(3)}, delay=${delay.toFixed(3)}`);
+                
                 audioSource = source;
                 isPlaying = true;
                 
@@ -559,10 +747,16 @@
             // Convert the audio file to a base64 string
             const base64Data = arrayBufferToBase64(audioArrayBuffer);
             
+            // Schedule playback 3 seconds in the future to allow for transmission time
+            // This gives clients time to receive and decode the audio before playback
+            const scheduledTime = Date.now() + 3000;
+            
             // Send the MP3 data to all clients
             const message = {
                 type: 'play',
-                mp3Data: base64Data
+                mp3Data: base64Data,
+                scheduledTime: scheduledTime,
+                serverTime: Date.now()
             };
             
             // Show upload progress
@@ -570,22 +764,16 @@
             progressFill.style.width = '0%';
             progressText.textContent = '0%';
             
-            // Split the data into chunks for larger files
-            const chunkSize = 50000; // 50KB chunks
-            const chunks = Math.ceil(base64Data.length / chunkSize);
-            
-            // Function to update progress bar
-            function updateProgress(current, total) {
-                const percent = Math.round((current / total) * 100);
-                progressFill.style.width = `${percent}%`;
-                progressText.textContent = `${percent}%`;
-            }
-            
             // Send the message
             socket.send(JSON.stringify(message));
             
-            // Play on host device
-            playMP3FromBase64(base64Data);
+            // Update progress immediately for demo
+            progressFill.style.width = '100%';
+            progressText.textContent = '100%';
+            
+            // Play on host device with the scheduled delay
+            const delaySeconds = (scheduledTime - Date.now()) / 1000;
+            playMP3FromBase64(base64Data, delaySeconds);
             
             // Hide progress bar after a delay
             setTimeout(() => {

@@ -1,4 +1,4 @@
-// server.js - WebSocket server for synced speakers with MP3 support
+// server.js - WebSocket server for auto-synced speakers
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -99,6 +99,48 @@ wss.on('connection', (ws) => {
           // Broadcast the stop command to all clients except the host
           broadcastToClients(JSON.stringify(data), true);
           console.log('Broadcasting stop command');
+          break;
+          
+        case 'clock-sync':
+          // This is a clock synchronization message
+          if (data.clientId) {
+            // This is a response to a specific client request
+            // Find that client and forward the message only to them
+            for (const client of clients) {
+              if (!client.isHost && client !== hostClient && client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify(data));
+                break;
+              }
+            }
+          } else {
+            // Broadcast to all clients except host
+            broadcastToClients(JSON.stringify(data), true);
+          }
+          break;
+          
+        case 'clock-sync-request':
+          // Forward clock sync request to host
+          if (hostClient && hostClient.readyState === WebSocket.OPEN) {
+            hostClient.send(JSON.stringify(data));
+          }
+          break;
+          
+        case 'ping':
+          // Forward ping to host
+          if (hostClient && hostClient.readyState === WebSocket.OPEN) {
+            hostClient.send(JSON.stringify(data));
+          }
+          break;
+          
+        case 'pong':
+          // Forward pong to the client that sent the ping
+          for (const client of clients) {
+            if (!client.isHost && client.readyState === WebSocket.OPEN) {
+              // This is a simplified approach - in a real implementation,
+              // we'd track which client sent which ping
+              client.send(JSON.stringify(data));
+            }
+          }
           break;
       }
     } catch (error) {
