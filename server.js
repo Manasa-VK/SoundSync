@@ -21,10 +21,18 @@ const server = http.createServer((req, res) => {
     res.writeHead(404);
     res.end('Not found');
   }
+  
+  // Handle large messages
+  req.on('error', (err) => {
+    console.error('Request error:', err);
+  });
 });
 
-// Create WebSocket server
-const wss = new WebSocket.Server({ server });
+// Create WebSocket server with increased max message size
+const wss = new WebSocket.Server({ 
+  server,
+  maxPayload: 50 * 1024 * 1024  // 50MB max payload size for audio files
+});
 
 // Keep track of all connected clients
 const clients = new Set();
