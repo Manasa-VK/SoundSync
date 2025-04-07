@@ -182,6 +182,61 @@
             margin-top: 5px;
             height: 15px;
         }
+        .share-url-container {
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            display: none;
+        }
+        .share-url-label {
+            font-size: 14px;
+            color: #aaa;
+            margin-bottom: 10px;
+        }
+        .share-urls {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .share-url-box {
+            display: flex;
+            align-items: center;
+            background-color: #1e1e1e;
+            border-radius: 8px;
+            padding: 8px;
+        }
+        .share-url-info {
+            flex-grow: 1;
+        }
+        .share-url {
+            font-family: monospace;
+            color: #1db954;
+            word-break: break-all;
+            margin-right: 10px;
+        }
+        .network-type {
+            font-size: 12px;
+            color: #aaa;
+            margin-top: 4px;
+        }
+        .copy-button {
+            background-color: #333;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background-color 0.2s;
+            white-space: nowrap;
+        }
+        .copy-button:hover {
+            background-color: #444;
+        }
+        .copy-button.copied {
+            background-color: #1db954;
+        }
     </style>
 </head>
 <body>
@@ -212,6 +267,14 @@
         
         <div id="host-controls" class="host-controls">
             <h2>Host Controls</h2>
+            
+            <div id="share-url-container" class="share-url-container">
+                <div class="share-url-label">Share one of these URLs with others on your network:</div>
+                <div id="share-urls" class="share-urls">
+                    <!-- URLs will be added here dynamically -->
+                </div>
+            </div>
+            
             <label for="audio-file" class="file-label">Choose Audio File</label>
             <input type="file" id="audio-file" class="file-input" accept="audio/*">
             <div id="selected-file">No file selected</div>
@@ -244,6 +307,7 @@
         let isPlaying = false;
         let audioArrayBuffer = null;
         let audioFile = null;
+        let shareUrls = new Map(); // Map to store URLs and their corresponding elements
         
         // Synchronization variables
         let clockOffset = 0;       // Difference between local and server time
@@ -342,7 +406,15 @@
                     hostControls.style.display = 'block';
                     connectionStatus.textContent = 'Hosting Active';
                     connectionStatus.className = 'connected';
-                    syncInfo.textContent = 'Share this page URL with others on your network to join';
+                    
+                    // Get and display the share URLs
+                    const protocol = window.location.protocol;
+                    const hostname = window.location.hostname;
+                    const port = window.location.port;
+                    const shareUrlsContainer = document.getElementById('share-urls');
+                    shareUrlsContainer.innerHTML = ''; // Clear existing URLs
+                    
+                    const shareUrls = new Map(); // Map to store URLs and their corresponding elements
                     
                     // Start clock sync broadcast every 10 seconds
                     setInterval(broadcastClockSync, 10000);
@@ -365,6 +437,63 @@
                     switch (message.type) {
                         case 'host-confirmed':
                             console.log(`Host confirmed. ${message.clientCount} clients connected`);
+                            
+                            // Update share URLs with all available IP addresses
+                            if (message.localIps && message.localIps.length > 0) {
+                                const shareUrlsContainer = document.getElementById('share-urls');
+                                const shareUrlContainer = document.getElementById('share-url-container');
+                                shareUrlsContainer.innerHTML = ''; // Clear existing URLs
+                                
+                                message.localIps.forEach(ip => {
+                                    const url = `http://${ip}:${message.port}`;
+                                    const networkType = ip.startsWith('192.168') ? 'Home/Office Network' : 
+                                                      ip.startsWith('10.') ? 'Enterprise Network' : 
+                                                      'Other Network';
+                                    
+                                    const urlBox = document.createElement('div');
+                                    urlBox.className = 'share-url-box';
+                                    
+                                    const urlInfo = document.createElement('div');
+                                    urlInfo.className = 'share-url-info';
+                                    
+                                    const urlText = document.createElement('div');
+                                    urlText.className = 'share-url';
+                                    urlText.textContent = url;
+                                    
+                                    const networkTypeText = document.createElement('div');
+                                    networkTypeText.className = 'network-type';
+                                    networkTypeText.textContent = networkType;
+                                    
+                                    const copyBtn = document.createElement('button');
+                                    copyBtn.className = 'copy-button';
+                                    copyBtn.textContent = 'Copy';
+                                    
+                                    urlInfo.appendChild(urlText);
+                                    urlInfo.appendChild(networkTypeText);
+                                    urlBox.appendChild(urlInfo);
+                                    urlBox.appendChild(copyBtn);
+                                    shareUrlsContainer.appendChild(urlBox);
+                                    
+                                    // Add click handler for this copy button
+                                    copyBtn.addEventListener('click', async () => {
+                                        try {
+                                            await navigator.clipboard.writeText(url);
+                                            copyBtn.textContent = 'Copied!';
+                                            copyBtn.classList.add('copied');
+                                            setTimeout(() => {
+                                                copyBtn.textContent = 'Copy';
+                                                copyBtn.classList.remove('copied');
+                                            }, 2000);
+                                        } catch (err) {
+                                            console.error('Failed to copy:', err);
+                                        }
+                                    });
+                                });
+                                
+                                // Show the container
+                                shareUrlContainer.style.display = 'block';
+                            }
+                            
                             // Initial clock sync broadcast
                             broadcastClockSync();
                             break;

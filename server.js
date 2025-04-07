@@ -52,10 +52,29 @@ wss.on('connection', (ws) => {
           ws.isHost = true;
           console.log('Host registered');
           
-          // Send confirmation to the host
+          // Find all local IP addresses
+          const { networkInterfaces } = require('os');
+          const nets = networkInterfaces();
+          const localIps = [];
+          
+          for (const name of Object.keys(nets)) {
+            for (const net of nets[name]) {
+              // Only get IPv4 addresses and skip internal ones
+              if (net.family === 'IPv4' && !net.internal) {
+                localIps.push(net.address);
+                console.log(`Found IP address: ${net.address} on interface ${name}`);
+              }
+            }
+          }
+          
+          console.log('All found IP addresses:', localIps);
+          
+          // Send confirmation to the host with all IP addresses
           ws.send(JSON.stringify({
             type: 'host-confirmed',
-            clientCount: clients.size
+            clientCount: clients.size,
+            localIps: localIps,
+            port: process.env.PORT || 8080
           }));
           break;
           
