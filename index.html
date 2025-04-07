@@ -308,6 +308,14 @@
         let audioArrayBuffer = null;
         let audioFile = null;
         let shareUrls = new Map(); // Map to store URLs and their corresponding elements
+        let decodedBuffer = null;  // Store decoded audio buffer for instant playback
+        let preloadInProgress = false; // Flag for audio preloading
+        let decodingStartTime = 0; // When decoding started (for performance measurements)
+        let pendingAudioData = null; // Store pending audio data during preparation
+        let pendingAudioInfo = null; // Store audio metadata during preparation
+        let audioElementFallback = null; // Fallback audio element if Web Audio API fails
+        let audioContextErrored = false; // Flag to track if audio context initialization failed
+        let autoResumeAttempts = 0; // Counter for auto-resume attempts
         
         // Synchronization variables
         let clockOffset = 0;       // Difference between local and server time
@@ -315,6 +323,17 @@
         let audioLatency = 0;      // Audio device latency in ms
         let syncSamples = [];      // Samples for calculating average offset
         let syncInProgress = false;
+        let syncVerified = false;  // Whether sync verification has completed
+        let currentPlayId = null;  // Track the current play session ID
+        let playbackStartTime = 0; // When playback started (for drift correction)
+        let playbackPosition = 0;  // Current playback position in seconds
+        let driftCorrection = 0;   // Drift correction in seconds
+        let syncCheckInterval = null; // Interval for checking sync during playback
+        
+        // Reconnection handling
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        const reconnectDelay = 2000; // Start with 2 seconds, will increase with each attempt
         
         // Elements
         const hostBtn = document.getElementById('host-btn');
@@ -338,33 +357,172 @@
         // Initialize audio context
         function initAudio() {
             try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                gainNode = audioContext.createGain();
-                analyzer = audioContext.createAnalyser();
-                analyzer.fftSize = 256;
-                
-                gainNode.connect(analyzer);
-                analyzer.connect(audioContext.destination);
-                
-                // Set initial volume
-                gainNode.gain.value = volumeSlider.value;
+                // Only create a new context if we don't have one
+                if (!audioContext) {
+                    console.log('Creating new audio context');
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    
+                    // Set up autoplay handling to work with modern browser restrictions
+                    setupAutoPlayHandling();
+                    
+                    gainNode = audioContext.createGain();
+                    analyzer = audioContext.createAnalyser();
+                    analyzer.fftSize = 256;
+                    
+                    gainNode.connect(analyzer);
+                    analyzer.connect(audioContext.destination);
+                    
+                    // Set initial volume
+                    gainNode.gain.value = volumeSlider.value;
+                    
+                    // Log the initial state
+                    console.log('Audio context created, state:', audioContext.state);
+                    
+                    // For browsers that suspend by default
+                    if (audioContext.state === 'suspended') {
+                        console.log('Audio context suspended, attempting to resume...');
+                        resumeAudioContext();
+                    }
+                    
+                    // Measure audio device latency
+                    measureAudioLatency();
+                } else {
+                    // If we already have a context but it's suspended, try to resume it
+                    if (audioContext.state === 'suspended') {
+                        console.log('Existing audio context suspended, attempting to resume...');
+                        resumeAudioContext();
+                    }
+                }
                 
                 // Enable test button
                 testBtn.disabled = false;
                 
-                // Estimate audio device latency
-                estimateAudioLatency();
-                
                 return true;
             } catch (error) {
-                console.error('Web Audio API not supported:', error);
+                console.error('Web Audio API initialization error:', error);
+                audioContextErrored = true;
                 connectionStatus.textContent = 'Audio not supported on this browser';
                 connectionStatus.className = 'disconnected';
+                
+                // Try to recover on next user interaction
+                document.addEventListener('click', handleUserInteraction, { once: true });
                 return false;
             }
         }
         
-        // Estimate audio device latency
+        // Set up handling for autoplay restrictions in modern browsers
+        function setupAutoPlayHandling() {
+            if (!audioContext) return;
+            
+            // Listen for state changes
+            audioContext.onstatechange = function() {
+                console.log('Audio context state changed to:', audioContext.state);
+                
+                if (audioContext.state === 'running') {
+                    // Clear any warnings if context is now running
+                    if (syncInfo.textContent.includes('interact with the page')) {
+                        syncInfo.textContent = 'Audio enabled successfully';
+                    }
+                } else if (audioContext.state === 'suspended') {
+                    // Show hint to users
+                    syncInfo.textContent = 'Audio suspended - please interact with the page to enable audio';
+                }
+            };
+            
+            // Add interaction handlers to auto-resume audio
+            const interactionEvents = ['click', 'touchstart', 'keydown'];
+            interactionEvents.forEach(event => {
+                document.addEventListener(event, handleUserInteraction, { once: true });
+            });
+        }
+        
+        // Handle user interaction to enable audio
+        function handleUserInteraction() {
+            if (audioContext && audioContext.state === 'suspended') {
+                console.log('User interaction detected, attempting to resume audio context');
+                resumeAudioContext();
+            }
+        }
+        
+        // Resume the audio context with retries
+        function resumeAudioContext() {
+            if (!audioContext || audioContext.state === 'running' || autoResumeAttempts > 5) return;
+            
+            autoResumeAttempts++;
+            console.log(`Attempt #${autoResumeAttempts} to resume audio context`);
+            
+            audioContext.resume().then(() => {
+                console.log('AudioContext resumed successfully!');
+                autoResumeAttempts = 0;
+                
+                // Refresh UI to show audio is available
+                if (syncInfo.textContent.includes('interact with the page')) {
+                    syncInfo.textContent = 'Audio enabled successfully';
+                }
+            }).catch(err => {
+                console.error('Failed to resume audio context:', err);
+                
+                // If we failed, try again on next interaction
+                if (autoResumeAttempts <= 5) {
+                    document.addEventListener('click', handleUserInteraction, { once: true });
+                }
+            });
+        }
+        
+        // Measure audio device latency more accurately
+        function measureAudioLatency() {
+            // Start with browser-based estimates
+            estimateAudioLatency();
+            
+            // Then do a more accurate measurement if possible
+            try {
+                if (audioContext.getOutputTimestamp) {
+                    const baseline = audioContext.getOutputTimestamp();
+                    const contextTime = baseline.contextTime;
+                    const performanceTime = baseline.performanceTime;
+                    
+                    // The difference between performance.now() and the performance time
+                    // reported by the audio context gives us a good estimate of output latency
+                    const performanceDelta = performance.now() - performanceTime;
+                    
+                    // Add a small buffer for safety (10ms)
+                    audioLatency = Math.max(audioLatency, performanceDelta + 10);
+                    console.log(`Measured audio output latency: ${audioLatency.toFixed(2)}ms`);
+                }
+                
+                // Register for a more refined measurement after audio starts playing
+                setTimeout(refineAudioLatencyMeasurement, 1000);
+            } catch (e) {
+                console.log('Advanced audio latency measurement not supported');
+            }
+        }
+        
+        // Refine audio latency measurement after audio context is running
+        function refineAudioLatencyMeasurement() {
+            try {
+                if (audioContext && audioContext.state === 'running' && audioContext.getOutputTimestamp) {
+                    const measurement = audioContext.getOutputTimestamp();
+                    const contextTime = measurement.contextTime;
+                    const performanceTime = measurement.performanceTime;
+                    
+                    // Calculate the actual output latency
+                    const performanceDelta = performance.now() - performanceTime;
+                    
+                    // Update our latency estimate with a weighted average
+                    audioLatency = (audioLatency * 0.7) + (performanceDelta * 0.3);
+                    console.log(`Refined audio output latency: ${audioLatency.toFixed(2)}ms`);
+                    
+                    // Update calibration info
+                    if (calibrationInfo) {
+                        calibrationInfo.textContent = `Sync offset: ${Math.round(clockOffset)}ms, Network latency: ${Math.round(networkLatency)}ms, Audio latency: ${Math.round(audioLatency)}ms`;
+                    }
+                }
+            } catch (e) {
+                console.error('Error measuring audio latency', e);
+            }
+        }
+        
+        // Fall back to browser-based audio latency estimates
         function estimateAudioLatency() {
             // Different browsers have different typical audio latencies
             const userAgent = navigator.userAgent.toLowerCase();
@@ -391,226 +549,644 @@
             const wsUrl = `${protocol}${window.location.host}`;
             
             console.log('Connecting to WebSocket at:', wsUrl);
+            connectionStatus.textContent = 'Connecting...';
+            connectionStatus.className = 'connecting';
             
-            socket = new WebSocket(wsUrl);
-            
-            socket.onopen = function() {
-                console.log('WebSocket connection established');
-                
-                if (isHost) {
-                    // Register as host
-                    socket.send(JSON.stringify({
-                        type: 'host'
-                    }));
-                    
-                    hostControls.style.display = 'block';
-                    connectionStatus.textContent = 'Hosting Active';
-                    connectionStatus.className = 'connected';
-                    
-                    // Get and display the share URLs
-                    const protocol = window.location.protocol;
-                    const hostname = window.location.hostname;
-                    const port = window.location.port;
-                    const shareUrlsContainer = document.getElementById('share-urls');
-                    shareUrlsContainer.innerHTML = ''; // Clear existing URLs
-                    
-                    const shareUrls = new Map(); // Map to store URLs and their corresponding elements
-                    
-                    // Start clock sync broadcast every 10 seconds
-                    setInterval(broadcastClockSync, 10000);
-                } else {
-                    // Register as client
-                    socket.send(JSON.stringify({
-                        type: 'join',
-                        deviceName: `Device_${Math.floor(Math.random() * 10000)}`
-                    }));
-                    
-                    // Start clock synchronization immediately
-                    requestClockSync();
-                }
-            };
-            
-            socket.onmessage = function(event) {
+            // Clean up any existing socket
+            if (socket) {
                 try {
-                    const message = JSON.parse(event.data);
+                    socket.close();
+                } catch (e) {
+                    console.error('Error closing existing socket:', e);
+                }
+            }
+            
+            // Create new socket connection
+            try {
+                socket = new WebSocket(wsUrl);
+                
+                socket.onopen = function() {
+                    console.log('WebSocket connection established');
                     
-                    switch (message.type) {
-                        case 'host-confirmed':
-                            console.log(`Host confirmed. ${message.clientCount} clients connected`);
-                            
-                            // Update share URLs with all available IP addresses
-                            if (message.localIps && message.localIps.length > 0) {
-                                const shareUrlsContainer = document.getElementById('share-urls');
-                                const shareUrlContainer = document.getElementById('share-url-container');
-                                shareUrlsContainer.innerHTML = ''; // Clear existing URLs
+                    if (isHost) {
+                        // Register as host
+                        socket.send(JSON.stringify({
+                            type: 'host'
+                        }));
+                        
+                        hostControls.style.display = 'block';
+                        connectionStatus.textContent = 'Hosting Active';
+                        connectionStatus.className = 'connected';
+                        
+                        // Get and display the share URLs
+                        const protocol = window.location.protocol;
+                        const hostname = window.location.hostname;
+                        const port = window.location.port;
+                        const shareUrlsContainer = document.getElementById('share-urls');
+                        shareUrlsContainer.innerHTML = ''; // Clear existing URLs
+                        
+                        const shareUrls = new Map(); // Map to store URLs and their corresponding elements
+                        
+                        // Start clock sync broadcast every 10 seconds
+                        setInterval(broadcastClockSync, 10000);
+                    } else {
+                        // Register as client
+                        socket.send(JSON.stringify({
+                            type: 'join',
+                            deviceName: `Device_${Math.floor(Math.random() * 10000)}`
+                        }));
+                        
+                        // Start clock synchronization immediately
+                        requestClockSync();
+                    }
+                };
+                
+                socket.onmessage = function(event) {
+                    // Handle incoming message (existing code)
+                    try {
+                        const message = JSON.parse(event.data);
+                        
+                        // Reset reconnect attempts on successful message
+                        reconnectAttempts = 0;
+                        
+                        // Existing message handling code
+                        switch (message.type) {
+                            case 'host-confirmed':
+                                console.log(`Host confirmed. ${message.clientCount} clients connected`);
                                 
-                                message.localIps.forEach(ip => {
-                                    const url = `http://${ip}:${message.port}`;
-                                    const networkType = ip.startsWith('192.168') ? 'Home/Office Network' : 
-                                                      ip.startsWith('10.') ? 'Enterprise Network' : 
-                                                      'Other Network';
+                                // Update share URLs with all available IP addresses
+                                if (message.localIps && message.localIps.length > 0) {
+                                    const shareUrlsContainer = document.getElementById('share-urls');
+                                    const shareUrlContainer = document.getElementById('share-url-container');
+                                    shareUrlsContainer.innerHTML = ''; // Clear existing URLs
                                     
-                                    const urlBox = document.createElement('div');
-                                    urlBox.className = 'share-url-box';
-                                    
-                                    const urlInfo = document.createElement('div');
-                                    urlInfo.className = 'share-url-info';
-                                    
-                                    const urlText = document.createElement('div');
-                                    urlText.className = 'share-url';
-                                    urlText.textContent = url;
-                                    
-                                    const networkTypeText = document.createElement('div');
-                                    networkTypeText.className = 'network-type';
-                                    networkTypeText.textContent = networkType;
-                                    
-                                    const copyBtn = document.createElement('button');
-                                    copyBtn.className = 'copy-button';
-                                    copyBtn.textContent = 'Copy';
-                                    
-                                    urlInfo.appendChild(urlText);
-                                    urlInfo.appendChild(networkTypeText);
-                                    urlBox.appendChild(urlInfo);
-                                    urlBox.appendChild(copyBtn);
-                                    shareUrlsContainer.appendChild(urlBox);
-                                    
-                                    // Add click handler for this copy button
-                                    copyBtn.addEventListener('click', async () => {
-                                        try {
-                                            await navigator.clipboard.writeText(url);
-                                            copyBtn.textContent = 'Copied!';
-                                            copyBtn.classList.add('copied');
-                                            setTimeout(() => {
-                                                copyBtn.textContent = 'Copy';
-                                                copyBtn.classList.remove('copied');
-                                            }, 2000);
-                                        } catch (err) {
-                                            console.error('Failed to copy:', err);
-                                        }
+                                    message.localIps.forEach(ip => {
+                                        const url = `http://${ip}:${message.port}`;
+                                        const networkType = ip.startsWith('192.168') ? 'Home/Office Network' : 
+                                                          ip.startsWith('10.') ? 'Enterprise Network' : 
+                                                          'Other Network';
+                                        
+                                        const urlBox = document.createElement('div');
+                                        urlBox.className = 'share-url-box';
+                                        
+                                        const urlInfo = document.createElement('div');
+                                        urlInfo.className = 'share-url-info';
+                                        
+                                        const urlText = document.createElement('div');
+                                        urlText.className = 'share-url';
+                                        urlText.textContent = url;
+                                        
+                                        const networkTypeText = document.createElement('div');
+                                        networkTypeText.className = 'network-type';
+                                        networkTypeText.textContent = networkType;
+                                        
+                                        const copyBtn = document.createElement('button');
+                                        copyBtn.className = 'copy-button';
+                                        copyBtn.textContent = 'Copy';
+                                        
+                                        urlInfo.appendChild(urlText);
+                                        urlInfo.appendChild(networkTypeText);
+                                        urlBox.appendChild(urlInfo);
+                                        urlBox.appendChild(copyBtn);
+                                        shareUrlsContainer.appendChild(urlBox);
+                                        
+                                        // Add click handler for this copy button
+                                        copyBtn.addEventListener('click', async () => {
+                                            try {
+                                                await navigator.clipboard.writeText(url);
+                                                copyBtn.textContent = 'Copied!';
+                                                copyBtn.classList.add('copied');
+                                                setTimeout(() => {
+                                                    copyBtn.textContent = 'Copy';
+                                                    copyBtn.classList.remove('copied');
+                                                }, 2000);
+                                            } catch (err) {
+                                                console.error('Failed to copy:', err);
+                                            }
+                                        });
                                     });
-                                });
+                                    
+                                    // Show the container
+                                    shareUrlContainer.style.display = 'block';
+                                }
                                 
-                                // Show the container
-                                shareUrlContainer.style.display = 'block';
-                            }
-                            
-                            // Initial clock sync broadcast
-                            broadcastClockSync();
-                            break;
-                            
-                        case 'join-confirmed':
-                            connectionStatus.textContent = 'Connected to Session';
-                            connectionStatus.className = 'connected';
-                            syncInfo.textContent = 'Calibrating time synchronization...';
-                            break;
-                            
-                        case 'client-joined':
-                            if (isHost) {
-                                addDeviceToList(message.deviceName);
-                            }
-                            break;
-                            
-                        case 'client-left':
-                            if (isHost) {
-                                removeDeviceFromList(message.deviceName);
-                            }
-                            break;
-                            
-                        case 'play':
-                            if (!isHost) {
-                                if (message.mp3Data) {
-                                    // Apply time synchronization
+                                // Initial clock sync broadcast
+                                broadcastClockSync();
+                                break;
+                                
+                            case 'join-confirmed':
+                                connectionStatus.textContent = 'Connected to Session';
+                                connectionStatus.className = 'connected';
+                                syncInfo.textContent = 'Calibrating time synchronization...';
+                                break;
+                                
+                            case 'client-joined':
+                                if (isHost) {
+                                    addDeviceToList(message.deviceName);
+                                }
+                                break;
+                                
+                            case 'client-left':
+                                if (isHost) {
+                                    removeDeviceFromList(message.deviceName);
+                                }
+                                break;
+                                
+                            case 'play':
+                                if (!isHost) {
+                                    if (message.mp3Data) {
+                                        // Store the playback ID
+                                        currentPlayId = message.playbackId;
+                                        console.log('Client received play command with MP3 data, size:', 
+                                            (message.mp3Data.length * 0.75 / (1024*1024)).toFixed(2) + 'MB');
+                                        
+                                        // If we're receiving an actual audio file
+                                        if (pendingAudioData !== message.mp3Data) {
+                                            pendingAudioData = message.mp3Data;
+                                            
+                                            // If we have time, try to decode the audio in advance
+                                            if (!decodedBuffer) {
+                                                const decodeStartTime = performance.now();
+                                                console.log('Starting client-side decode...');
+                                                // Start decoding right away
+                                                preDecodeAudio(message.mp3Data);
+                                            }
+                                        }
+                                        
+                                        // Apply time synchronization
+                                        const serverScheduledTime = message.scheduledTime;
+                                        const localScheduledTime = serverScheduledTime - clockOffset;
+                                        const nowLocal = Date.now();
+                                        
+                                        // Calculate delay in seconds
+                                        // The formula accounts for network latency, clock offset, and audio device latency
+                                        let delay = (localScheduledTime - nowLocal) / 1000;
+                                        
+                                        // Adjust for audio latency (subtract our latency since we need to start earlier)
+                                        delay -= (audioLatency / 1000);
+                                        
+                                        console.log(`Client playing with synchronized delay: ${delay.toFixed(3)}s`);
+                                        syncInfo.textContent = 'Playing synchronized audio';
+                                        calibrationInfo.textContent = `Sync offset: ${Math.round(clockOffset)}ms, Network latency: ${Math.round(networkLatency)}ms, Audio latency: ${Math.round(audioLatency)}ms`;
+                                        
+                                        // If we already have a decoded buffer, use it
+                                        if (decodedBuffer) {
+                                            console.log('Using already decoded buffer for playback');
+                                            playFromDecodedBuffer(decodedBuffer, delay);
+                                        } else {
+                                            // Otherwise, we need to decode the audio data and then play it
+                                            console.log('Decoding MP3 data for playback');
+                                            playMP3FromBase64(message.mp3Data, delay);
+                                        }
+                                    } else {
+                                        // This is a test tone playback
+                                        console.log('Received test tone playback command');
+                                        
+                                        // Apply time synchronization for the test tone
+                                        const serverTime = message.serverTime;
+                                        const serverScheduledTime = message.scheduledTime;
+                                        const localScheduledTime = serverScheduledTime - clockOffset;
+                                        const nowLocal = Date.now();
+                                        
+                                        // Calculate delay in seconds
+                                        let delay = (localScheduledTime - nowLocal) / 1000;
+                                        
+                                        // Adjust for audio latency
+                                        delay -= (audioLatency / 1000);
+                                        
+                                        console.log(`Playing test tone with delay: ${delay.toFixed(3)}s`);
+                                        
+                                        // Play a test tone with the calculated delay
+                                        playTestToneWithDelay(delay);
+                                    }
+                                }
+                                break;
+                                
+                            case 'sync-verification':
+                                if (!isHost) {
+                                    // The server is requesting sync verification before playing
+                                    currentPlayId = message.playId;
+                                    console.log(`Received sync verification request for playback ${currentPlayId}`);
+                                    
+                                    // Store any audio info for preparation
+                                    if (message.audioInfo) {
+                                        pendingAudioInfo = message.audioInfo;
+                                    }
+                                    
+                                    // Verify that we have proper synchronization
+                                    const syncAccuracy = verifySynchronization();
+                                    syncVerified = true;
+                                    
+                                    // Perform additional preparation if we have pending audio data
+                                    if (pendingAudioData && !decodedBuffer) {
+                                        // Try to pre-decode the audio
+                                        preDecodeAudio(pendingAudioData);
+                                    }
+                                    
+                                    // Respond with our current synchronization status
+                                    socket.send(JSON.stringify({
+                                        type: 'client-ready',
+                                        clientId: getClientId(),
+                                        playId: currentPlayId,
+                                        syncInfo: {
+                                            clockOffset: clockOffset,
+                                            networkLatency: networkLatency,
+                                            audioLatency: audioLatency,
+                                            accuracyScore: syncAccuracy,
+                                            decodedBuffer: !!decodedBuffer
+                                        }
+                                    }));
+                                    
+                                    console.log(`Sent readiness confirmation with accuracy score: ${syncAccuracy.toFixed(2)}`);
+                                }
+                                break;
+                                
+                            case 'client-sync-status':
+                                if (isHost) {
+                                    // Update UI to show sync status
+                                    console.log(`Client sync status: ${message.readyCount}/${message.totalClients} ready`);
+                                    syncInfo.textContent = `Synchronizing devices: ${message.readyCount}/${message.totalClients} ready`;
+                                }
+                                break;
+                                
+                            case 'host-play':
+                                if (isHost) {
+                                    // The server is telling the host to play now that clients are synced
+                                    console.log('Received synchronized play command for host');
+                                    
+                                    // Force trigger any autoplay restrictions
+                                    if (audioContext && audioContext.state === 'suspended') {
+                                        console.log('Resuming audio context due to host-play command');
+                                        audioContext.resume().catch(err => console.error('Failed to resume on host-play:', err));
+                                    }
+                                    
+                                    // Save the playback ID
+                                    currentPlayId = message.playbackId;
+                                    
+                                    // Apply time synchronization (even though we're the host)
                                     const serverScheduledTime = message.scheduledTime;
-                                    const localScheduledTime = serverScheduledTime - clockOffset;
                                     const nowLocal = Date.now();
                                     
                                     // Calculate delay in seconds
-                                    // The formula accounts for network latency, clock offset, and audio device latency
-                                    let delay = (localScheduledTime - nowLocal) / 1000;
+                                    let delay = (serverScheduledTime - nowLocal) / 1000;
                                     
-                                    // Adjust for audio latency (subtract our latency since we need to start earlier)
+                                    // Host also needs to account for audio latency
                                     delay -= (audioLatency / 1000);
                                     
-                                    console.log(`Playing with synchronized delay: ${delay.toFixed(3)}s`);
-                                    calibrationInfo.textContent = `Sync offset: ${Math.round(clockOffset)}ms, Network latency: ${Math.round(networkLatency)}ms`;
+                                    console.log(`Host playing with synchronized delay: ${delay.toFixed(3)}s`);
+                                    syncInfo.textContent = 'Playing synchronized audio (host)';
                                     
-                                    playMP3FromBase64(message.mp3Data, delay);
-                                } else {
-                                    playTestTone();
+                                    // Check if we have the decoded buffer
+                                    console.log('Decoded buffer status:', decodedBuffer ? 'Available' : 'Not available');
+                                    console.log('Audio array buffer status:', audioArrayBuffer ? `Available (${(audioArrayBuffer.byteLength/(1024*1024)).toFixed(2)}MB)` : 'Not available');
+                                    
+                                    // Make sure audio is stopped before we try to play
+                                    stopAudio();
+                                    
+                                    try {
+                                        // Play using the pre-decoded buffer (host should have this)
+                                        if (decodedBuffer) {
+                                            console.log('Using decodedBuffer for host playback');
+                                            
+                                            // Create a new audio context if needed
+                                            if (!audioContext || audioContext.state === 'closed') {
+                                                console.log('Creating new audio context for host playback');
+                                                initAudio();
+                                            }
+                                            
+                                            // Direct play from decoded buffer to ensure it works
+                                            const source = audioContext.createBufferSource();
+                                            source.buffer = decodedBuffer;
+                                            source.connect(gainNode);
+                                            
+                                            let startTime;
+                                            if (delay > 0) {
+                                                startTime = audioContext.currentTime + delay;
+                                                console.log(`Host starting playback at future time: currentTime=${audioContext.currentTime.toFixed(3)}, startTime=${startTime.toFixed(3)}`);
+                                                source.start(startTime);
+                                            } else {
+                                                startTime = audioContext.currentTime;
+                                                const skipAhead = Math.min(Math.abs(delay), decodedBuffer.duration - 0.1);
+                                                console.log(`Host starting playback immediately, skipping ahead ${skipAhead.toFixed(3)}s`);
+                                                source.start(startTime, skipAhead);
+                                            }
+                                            
+                                            audioSource = source;
+                                            isPlaying = true;
+                                            
+                                            // Start visualizer
+                                            drawVisualizer();
+                                            
+                                            // Start drift monitoring
+                                            startDriftMonitoring(decodedBuffer.duration);
+                                            
+                                            source.onended = function() {
+                                                console.log('Host audio playback ended naturally');
+                                                isPlaying = false;
+                                                stopAudio();
+                                            };
+                                            
+                                        } else if (audioArrayBuffer) {
+                                            console.log('Using audioArrayBuffer for host playback');
+                                            // Try to decode it now
+                                            const bufferCopy = audioArrayBuffer.slice(0); // Create a copy to be safe
+                                            
+                                            try {
+                                                audioContext.decodeAudioData(bufferCopy, function(buffer) {
+                                                    console.log('Successfully decoded buffer for host playback');
+                                                    decodedBuffer = buffer;
+                                                    
+                                                    // Play using the freshly decoded buffer
+                                                    const source = audioContext.createBufferSource();
+                                                    source.buffer = buffer;
+                                                    source.connect(gainNode);
+                                                    
+                                                    let startTime;
+                                                    // Adjust delay to account for decoding time (we're now a bit later)
+                                                    const decodingDelay = (Date.now() - nowLocal) / 1000;
+                                                    const adjustedDelay = Math.max(-0.1, delay - decodingDelay);
+                                                    
+                                                    if (adjustedDelay > 0) {
+                                                        startTime = audioContext.currentTime + adjustedDelay;
+                                                        console.log(`Host starting playback (after decode) at future time: ${startTime.toFixed(3)}, adjusted delay: ${adjustedDelay.toFixed(3)}s`);
+                                                        source.start(startTime);
+                                                    } else {
+                                                        startTime = audioContext.currentTime;
+                                                        const skipAhead = Math.min(Math.abs(adjustedDelay), buffer.duration - 0.1);
+                                                        console.log(`Host starting playback (after decode) immediately, skipping ahead ${skipAhead.toFixed(3)}s`);
+                                                        source.start(startTime, skipAhead);
+                                                    }
+                                                    
+                                                    audioSource = source;
+                                                    isPlaying = true;
+                                                    
+                                                    // Start visualizer
+                                                    drawVisualizer();
+                                                    
+                                                    // Start drift monitoring
+                                                    startDriftMonitoring(buffer.duration);
+                                                    
+                                                    source.onended = function() {
+                                                        console.log('Host audio playback ended naturally');
+                                                        isPlaying = false;
+                                                        stopAudio();
+                                                    };
+                                                }, function(err) {
+                                                    console.error('Error decoding for host playback:', err);
+                                                    
+                                                    // Try creating a copy of the buffer via another method
+                                                    try {
+                                                        const tempBuffer = audioArrayBuffer.slice(0);
+                                                        const blob = new Blob([tempBuffer], {type: 'audio/mp3'});
+                                                        const tempAudio = new Audio();
+                                                        tempAudio.src = URL.createObjectURL(blob);
+                                                        
+                                                        console.log('Created temporary audio element for host playback');
+                                                        tempAudio.oncanplaythrough = function() {
+                                                            console.log('Temp audio ready to play for host');
+                                                            tempAudio.play()
+                                                                .then(() => {
+                                                                    console.log('Host fallback audio started playing!');
+                                                                    isPlaying = true;
+                                                                    audioSource = {
+                                                                        isMediaElement: true,
+                                                                        element: tempAudio,
+                                                                        stop: function() { tempAudio.pause(); }
+                                                                    };
+                                                                })
+                                                                .catch(e => {
+                                                                    console.error('Error in host temp Audio play:', e);
+                                                                    // Final fallback to HTML Audio element
+                                                                    playWithAudioElement(bufferCopy);
+                                                                });
+                                                        };
+                                                        
+                                                        tempAudio.onerror = function(e) {
+                                                            console.error('Host temp audio error:', e);
+                                                            // Final fallback
+                                                            playWithAudioElement(bufferCopy);
+                                                        };
+                                                    } catch (e) {
+                                                        console.error('Error in host blob fallback:', e);
+                                                        // Fallback to audio element
+                                                        playWithAudioElement(bufferCopy);
+                                                    }
+                                                });
+                                            } catch (decodeError) {
+                                                console.error('Critical error in host audio decoding:', decodeError);
+                                                // Fallback to audio element
+                                                playWithAudioElement(bufferCopy);
+                                            }
+                                        } else {
+                                            console.error('No audio data available for host playback!');
+                                            syncInfo.textContent = 'Error: No audio data available';
+                                        }
+                                    } catch (error) {
+                                        console.error('Critical error in host playback logic:', error);
+                                        // Try ultimate fallback
+                                        if (audioArrayBuffer) {
+                                            playWithAudioElement(audioArrayBuffer);
+                                        } else {
+                                            syncInfo.textContent = 'Error: Audio playback failed';
+                                        }
+                                    }
                                 }
-                            }
-                            break;
-                            
-                        case 'stop':
-                            if (!isHost) {
-                                stopAudio();
-                            }
-                            break;
-                            
-                        case 'clock-sync':
-                            if (!isHost) {
-                                handleClockSync(message);
-                            }
-                            break;
-                            
-                        case 'clock-sync-request':
-                            if (isHost) {
-                                // Respond with current time
+                                break;
+                                
+                            case 'request-playback-status':
+                                // Server is requesting our current playback status
+                                if (!isHost && isPlaying && message.playbackId === currentPlayId) {
+                                    // Calculate our current position and drift
+                                    const elapsedMs = Date.now() - playbackStartTime;
+                                    const expectedPosition = elapsedMs / 1000;
+                                    
+                                    // Get actual position from audio context
+                                    const actualPosition = audioContext.currentTime - audioSource.startTime;
+                                    
+                                    // Calculate drift
+                                    const drift = actualPosition - expectedPosition;
+                                    
+                                    // Send status back to server
+                                    socket.send(JSON.stringify({
+                                        type: 'playback-status',
+                                        clientId: getClientId(),
+                                        playbackId: currentPlayId,
+                                        position: actualPosition,
+                                        expectedPosition: expectedPosition,
+                                        drift: drift,
+                                        syncInfo: {
+                                            clockOffset: clockOffset,
+                                            networkLatency: networkLatency,
+                                            audioLatency: audioLatency
+                                        }
+                                    }));
+                                    
+                                    console.log(`Reporting playback status: pos=${actualPosition.toFixed(2)}s, drift=${drift.toFixed(3)}s`);
+                                }
+                                break;
+                                
+                            case 'drift-correction':
+                                // Server is sending a drift correction command
+                                if (!isHost && isPlaying && message.playbackId === currentPlayId) {
+                                    console.log(`Received drift correction: avg=${message.avgDrift.toFixed(3)}s, expected pos=${message.expectedPosition.toFixed(2)}s`);
+                                    
+                                    // Apply the correction
+                                    correctDrift(message.avgDrift);
+                                }
+                                break;
+                                
+                            case 'stop':
+                                if (!isHost) {
+                                    stopAudio();
+                                }
+                                break;
+                                
+                            case 'clock-sync':
+                                if (!isHost) {
+                                    handleClockSync(message);
+                                }
+                                break;
+                                
+                            case 'clock-sync-request':
+                                if (isHost) {
+                                    // Respond with current time
+                                    socket.send(JSON.stringify({
+                                        type: 'clock-sync',
+                                        serverTime: Date.now(),
+                                        clientId: message.clientId
+                                    }));
+                                }
+                                break;
+                                
+                            case 'ping':
+                                // Reply to ping with timestamp
                                 socket.send(JSON.stringify({
-                                    type: 'clock-sync',
-                                    serverTime: Date.now(),
+                                    type: 'pong',
+                                    originalTime: message.time,
+                                    replyTime: Date.now(),
                                     clientId: message.clientId
                                 }));
-                            }
-                            break;
-                            
-                        case 'ping':
-                            // Reply to ping with timestamp
-                            socket.send(JSON.stringify({
-                                type: 'pong',
-                                originalTime: message.time,
-                                replyTime: Date.now(),
-                                clientId: message.clientId
-                            }));
-                            break;
-                            
-                        case 'pong':
-                            if (!isHost && message.clientId === getClientId()) {
-                                const now = Date.now();
-                                const roundTrip = now - message.originalTime;
-                                networkLatency = roundTrip / 2; // Estimate one-way latency
+                                break;
                                 
-                                console.log(`Network latency: ${networkLatency.toFixed(2)}ms`);
-                                calibrationInfo.textContent = `Network latency: ${Math.round(networkLatency)}ms`;
-                                
-                                // After measuring network latency, request clock sync
-                                if (syncInProgress) {
-                                    requestClockSync();
+                            case 'pong':
+                                if (!isHost && message.clientId === getClientId()) {
+                                    const now = Date.now();
+                                    const roundTrip = now - message.originalTime;
+                                    networkLatency = roundTrip / 2; // Estimate one-way latency
+                                    
+                                    console.log(`Network latency: ${networkLatency.toFixed(2)}ms`);
+                                    calibrationInfo.textContent = `Network latency: ${Math.round(networkLatency)}ms`;
+                                    
+                                    // After measuring network latency, request clock sync
+                                    if (syncInProgress) {
+                                        requestClockSync();
+                                    }
                                 }
-                            }
-                            break;
+                                break;
+                                
+                            case 'prepare-audio':
+                                if (!isHost) {
+                                    // The host is sending audio information to help with preparation
+                                    console.log(`Received audio preparation info: ${message.duration.toFixed(2)}s, ${message.fileSize} bytes`);
+                                    syncInfo.textContent = 'Preparing to receive audio...';
+                                    
+                                    // Store the audio metadata
+                                    pendingAudioInfo = {
+                                        fileSize: message.fileSize,
+                                        duration: message.duration,
+                                        sampleRate: message.sampleRate,
+                                        numberOfChannels: message.numberOfChannels
+                                    };
+                                    
+                                    // Pre-allocate an AudioBuffer to potentially speed up decoding
+                                    if (audioContext) {
+                                        try {
+                                            // Create a silent buffer matching the expected audio
+                                            const emptyBuffer = audioContext.createBuffer(
+                                                message.numberOfChannels,
+                                                message.sampleRate * Math.ceil(message.duration),
+                                                message.sampleRate
+                                            );
+                                            
+                                            // Warm up the audio system
+                                            const tempSource = audioContext.createBufferSource();
+                                            tempSource.buffer = emptyBuffer;
+                                            tempSource.connect(audioContext.destination);
+                                            tempSource.start(0, 0, 0.001); // Start but immediately stop
+                                            
+                                            console.log('Prepared audio system with matching buffer');
+                                        } catch (e) {
+                                            console.log('Error preparing audio system:', e);
+                                        }
+                                    }
+                                }
+                                break;
+                        }
+                    } catch (error) {
+                        console.error('Error parsing message:', error);
                     }
-                } catch (error) {
-                    console.error('Error parsing message:', error);
-                }
-            };
-            
-            socket.onclose = function() {
-                connectionStatus.textContent = 'Disconnected';
+                };
+                
+                socket.onclose = function(event) {
+                    console.log('WebSocket connection closed, code:', event.code, 'reason:', event.reason);
+                    
+                    if (event.wasClean) {
+                        connectionStatus.textContent = 'Disconnected';
+                        connectionStatus.className = 'disconnected';
+                        syncInfo.textContent = 'Connection closed. Please refresh the page.';
+                    } else {
+                        connectionStatus.textContent = 'Connection Lost';
+                        connectionStatus.className = 'disconnected';
+                        syncInfo.textContent = 'Connection lost. Attempting to reconnect...';
+                        
+                        // Attempt to reconnect automatically
+                        attemptReconnect();
+                    }
+                };
+                
+                socket.onerror = function(error) {
+                    console.error('WebSocket error:', error);
+                    connectionStatus.textContent = 'Connection Error';
+                    connectionStatus.className = 'disconnected';
+                    syncInfo.textContent = 'Connection error. Attempting to reconnect...';
+                    
+                    // We don't call attemptReconnect() here because onclose will be called after onerror
+                };
+            } catch (error) {
+                console.error('Error creating WebSocket:', error);
+                connectionStatus.textContent = 'Connection Failed';
                 connectionStatus.className = 'disconnected';
-                syncInfo.textContent = 'Connection lost. Please refresh the page.';
-            };
+                syncInfo.textContent = 'Failed to connect. Please refresh the page.';
+            }
             
-            socket.onerror = function(error) {
-                console.error('WebSocket error:', error);
-                connectionStatus.textContent = 'Connection Error';
-                connectionStatus.className = 'disconnected';
-                syncInfo.textContent = 'Could not connect to the server.';
-            };
-            
-            // Disable setup buttons
+            // Disable setup buttons during connection
             hostBtn.disabled = true;
             joinBtn.disabled = true;
+        }
+        
+        // Reconnection handling
+        function attemptReconnect() {
+            if (reconnectAttempts >= maxReconnectAttempts) {
+                console.log('Maximum reconnection attempts reached');
+                connectionStatus.textContent = 'Reconnection Failed';
+                syncInfo.textContent = 'Unable to reconnect. Please refresh the page.';
+                
+                // Re-enable setup buttons so user can try again
+                hostBtn.disabled = false;
+                joinBtn.disabled = false;
+                return;
+            }
+            
+            reconnectAttempts++;
+            const currentDelay = reconnectDelay * Math.pow(1.5, reconnectAttempts - 1); // Exponential backoff
+            
+            console.log(`Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts}) in ${currentDelay}ms`);
+            syncInfo.textContent = `Reconnecting... Attempt ${reconnectAttempts}/${maxReconnectAttempts}`;
+            
+            setTimeout(() => {
+                // Try to re-establish the same type of connection
+                setupConnection(isHost);
+            }, currentDelay);
         }
         
         // Get unique client ID (for synchronization messages)
@@ -640,6 +1216,38 @@
                 clientId: getClientId(),
                 clientTime: Date.now()
             }));
+        }
+        
+        // Verify synchronization quality and return an accuracy score (0-100)
+        function verifySynchronization() {
+            // Start with a base score of 100
+            let accuracyScore = 100;
+            
+            // Check how many clock sync samples we have (more is better)
+            const syncSampleScore = Math.min(syncSamples.length * 20, 40); // Up to 40 points for 5 samples
+            
+            // Calculate variation in sync samples (lower is better)
+            let variationScore = 40;
+            if (syncSamples.length > 1) {
+                const average = syncSamples.reduce((a, b) => a + b, 0) / syncSamples.length;
+                const squaredDiffs = syncSamples.map(x => Math.pow(x - average, 2));
+                const variance = squaredDiffs.reduce((a, b) => a + b, 0) / syncSamples.length;
+                const stdDev = Math.sqrt(variance);
+                
+                // Deduct points based on standard deviation (variation in measurements)
+                // Higher variation means less accurate synchronization
+                variationScore = Math.max(0, 40 - (stdDev / 5));
+            }
+            
+            // Factor in network latency (lower is better)
+            const latencyScore = Math.max(0, 20 - (networkLatency / 10)); // Up to 20 points
+            
+            // Calculate final score
+            accuracyScore = syncSampleScore + variationScore + latencyScore;
+            
+            console.log(`Sync verification: samples=${syncSamples.length}, variation=${variationScore.toFixed(2)}, latency=${latencyScore.toFixed(2)}, total=${accuracyScore.toFixed(2)}`);
+            
+            return accuracyScore;
         }
         
         // Handle clock sync response
@@ -712,46 +1320,449 @@
             
             stopAudio();
             
-            // Create oscillator for a test tone
-            const oscillator = audioContext.createOscillator();
-            oscillator.type = 'sine';
-            oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // A4 note
-            
-            oscillator.connect(gainNode);
-            oscillator.start();
-            oscillator.stop(audioContext.currentTime + 2); // Play for 2 seconds
-            
-            audioSource = oscillator;
-            isPlaying = true;
-            
-            // Start visualizer
-            drawVisualizer();
-            
-            // Auto-stop
-            setTimeout(() => {
-                if (isPlaying) {
-                    stopAudio();
+            try {
+                // Resume audio context if it's suspended
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume().then(() => {
+                        console.log('Audio context resumed successfully');
+                        createAndPlayTestTone();
+                    }).catch(err => {
+                        console.error('Failed to resume audio context:', err);
+                    });
+                } else {
+                    createAndPlayTestTone();
                 }
-            }, 2000);
+            } catch (error) {
+                console.error('Error in playTestTone:', error);
+            }
         }
         
-        // Play MP3 from base64 string with precise timing
-        function playMP3FromBase64(base64Data, delay = 0) {
+        function createAndPlayTestTone() {
+            try {
+                // Create oscillator for a test tone
+                const oscillator = audioContext.createOscillator();
+                oscillator.type = 'sine';
+                oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // A4 note
+                
+                oscillator.connect(gainNode);
+                oscillator.start();
+                oscillator.stop(audioContext.currentTime + 2); // Play for 2 seconds
+                
+                audioSource = oscillator;
+                isPlaying = true;
+                
+                console.log('Test tone started, current time:', audioContext.currentTime);
+                
+                // Start visualizer
+                drawVisualizer();
+                
+                // Auto-stop
+                setTimeout(() => {
+                    if (isPlaying) {
+                        stopAudio();
+                    }
+                }, 2000);
+            } catch (error) {
+                console.error('Error creating test tone:', error);
+            }
+        }
+        
+        // Add a dedicated function for test tone with delay
+        function playTestToneWithDelay(delay) {
             if (!audioContext) {
                 initAudio();
             }
             
             stopAudio();
             
-            // Convert base64 to array buffer
-            const binaryString = atob(base64Data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
+            try {
+                // Resume audio context if it's suspended
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume().then(() => {
+                        console.log('Audio context resumed successfully');
+                        scheduleTestTone(delay);
+                    }).catch(err => {
+                        console.error('Failed to resume audio context:', err);
+                    });
+                } else {
+                    scheduleTestTone(delay);
+                }
+            } catch (error) {
+                console.error('Error in playTestToneWithDelay:', error);
+            }
+        }
+        
+        function scheduleTestTone(delay) {
+            try {
+                // Create oscillator for a test tone
+                const oscillator = audioContext.createOscillator();
+                oscillator.type = 'sine';
+                oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // A4 note
+                
+                oscillator.connect(gainNode);
+                
+                // Calculate start time based on delay
+                let startTime;
+                
+                if (delay > 0) {
+                    // Future start time
+                    startTime = audioContext.currentTime + delay;
+                    console.log(`Scheduling test tone with future time: ${startTime.toFixed(3)}, delay: ${delay.toFixed(3)}s`);
+                    oscillator.start(startTime);
+                    oscillator.stop(startTime + 2); // Play for 2 seconds
+                } else {
+                    // Immediate playback
+                    startTime = audioContext.currentTime;
+                    console.log(`Playing test tone immediately (no delay)`);
+                    oscillator.start(startTime);
+                    oscillator.stop(startTime + 2); // Play for 2 seconds
+                }
+                
+                audioSource = oscillator;
+                isPlaying = true;
+                
+                // Start visualizer
+                drawVisualizer();
+                
+                // Auto-stop after slightly more than 2 seconds
+                setTimeout(() => {
+                    if (isPlaying) {
+                        stopAudio();
+                    }
+                }, 2200);
+            } catch (error) {
+                console.error('Error scheduling test tone:', error);
+            }
+        }
+        
+        // Handle file selection and pre-decode audio
+        audioFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                selectedFile.textContent = file.name;
+                
+                // Show loading state
+                playBtn.disabled = true;
+                stopBtn.disabled = true;
+                playBtn.textContent = "Preparing Audio...";
+                
+                // Read the file as an ArrayBuffer
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    audioArrayBuffer = e.target.result;
+                    preloadAudio(audioArrayBuffer);
+                };
+                reader.readAsArrayBuffer(file);
+            }
+        });
+        
+        // Pre-decode audio for instant playback
+        function preloadAudio(arrayBuffer) {
+            if (!audioContext) {
+                initAudio();
             }
             
-            // Decode the audio data
-            audioContext.decodeAudioData(bytes.buffer, function(buffer) {
+            preloadInProgress = true;
+            decodingStartTime = performance.now();
+            
+            // First, decode the audio to measure decoding time
+            try {
+                console.log('Starting audio decoding...');
+                audioContext.decodeAudioData(arrayBuffer.slice(0), function(buffer) {
+                    decodedBuffer = buffer;
+                    const decodingTime = performance.now() - decodingStartTime;
+                    console.log(`Audio decoded in ${decodingTime.toFixed(2)}ms, duration: ${buffer.duration.toFixed(2)}s, channels: ${buffer.numberOfChannels}`);
+                    
+                    // Test the decoded buffer
+                    try {
+                        const testSource = audioContext.createBufferSource();
+                        testSource.buffer = buffer;
+                        console.log('Buffer test successful');
+                    } catch (e) {
+                        console.error('Buffer test failed:', e);
+                    }
+                    
+                    // Enable playback
+                    playBtn.disabled = false;
+                    stopBtn.disabled = false;
+                    playBtn.textContent = "Play on All Devices";
+                    preloadInProgress = false;
+                }, function(error) {
+                    console.error('Error decoding audio data:', error);
+                    playBtn.textContent = "Error Preparing Audio";
+                    preloadInProgress = false;
+                    
+                    // Try again with a different approach
+                    console.log('Trying alternative decoding approach...');
+                    const fileReader = new FileReader();
+                    fileReader.onload = function() {
+                        const audioData = fileReader.result;
+                        audioContext.decodeAudioData(audioData, function(buffer) {
+                            decodedBuffer = buffer;
+                            console.log('Alternative decoding successful');
+                            playBtn.disabled = false;
+                            stopBtn.disabled = false;
+                            playBtn.textContent = "Play on All Devices";
+                        });
+                    };
+                    fileReader.readAsArrayBuffer(new Blob([arrayBuffer]));
+                });
+            } catch (error) {
+                console.error('Error initializing audio decode:', error);
+                playBtn.textContent = "Error Preparing Audio";
+                preloadInProgress = false;
+            }
+        }
+        
+        // Play MP3 from base64 string with precise timing
+        function playMP3FromBase64(base64Data, delay = 0) {
+            console.log('playMP3FromBase64 called with data size:', 
+                (base64Data.length * 0.75 / (1024*1024)).toFixed(2) + 'MB', 
+                'delay:', delay.toFixed(3) + 's');
+                
+            if (!audioContext) {
+                console.log('Initializing audio context...');
+                initAudio();
+            }
+            
+            stopAudio();
+            
+            // If we're the host and have a pre-decoded buffer, use it for instant playback
+            if (isHost && decodedBuffer) {
+                console.log('Host has pre-decoded buffer, using that');
+                playFromDecodedBuffer(decodedBuffer, delay);
+                return;
+            }
+            
+            // Save when we're starting playback (for drift correction)
+            playbackStartTime = Date.now();
+            playbackPosition = 0;
+            driftCorrection = 0;
+            
+            // Start decoding timer
+            const decodeStartTime = performance.now();
+            
+            // First check if we already have a decoded buffer
+            if (decodedBuffer) {
+                console.log('Using already decoded buffer');
+                playFromDecodedBuffer(decodedBuffer, delay);
+                return;
+            }
+            
+            // Convert base64 to array buffer
+            console.log('Converting base64 to array buffer...');
+            try {
+                const binaryString = atob(base64Data);
+                console.log('Binary string created, length:', binaryString.length);
+                
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+                
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                
+                // Make a copy of the buffer to avoid potential issues
+                const bufferCopy = bytes.buffer.slice(0);
+                
+                console.log('Created array buffer, size:', (bufferCopy.byteLength / (1024*1024)).toFixed(2) + 'MB');
+                
+                // First attempt: standard decoding
+                try {
+                    console.log('Attempting standard decoding...');
+                    audioContext.decodeAudioData(bufferCopy, function(decodedData) {
+                        const decodingTime = performance.now() - decodeStartTime;
+                        console.log(`Audio decoded in ${decodingTime.toFixed(2)}ms, playing with ${delay.toFixed(3)}s delay`);
+                        
+                        // Store for future use
+                        decodedBuffer = decodedData;
+                        
+                        // Get adjusted delay accounting for decoding time
+                        const adjustedDelay = Math.max(0, delay - (decodingTime / 1000));
+                        
+                        // Play the decoded audio
+                        console.log(`Playing decoded buffer with adjusted delay: ${adjustedDelay.toFixed(3)}s`);
+                        playFromDecodedBuffer(decodedData, adjustedDelay);
+                        
+                        // Report our decoding time to the server
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            socket.send(JSON.stringify({
+                                type: 'decoding-stats',
+                                clientId: getClientId(),
+                                decodingTime: decodingTime,
+                                fileSize: bufferCopy.byteLength
+                            }));
+                        }
+                    }, function(error) {
+                        console.error('Error decoding audio data:', error);
+                        
+                        // Fallback to using blobs and audio elements
+                        console.log('Trying fallback decoding method...');
+                        try {
+                            const blob = new Blob([bufferCopy], {type: 'audio/mp3'});
+                            console.log('Created blob:', blob.size, 'bytes');
+                            
+                            const url = URL.createObjectURL(blob);
+                            const tempAudio = new Audio();
+                            tempAudio.src = url;
+                            
+                            console.log('Created temporary audio element');
+                            tempAudio.oncanplaythrough = function() {
+                                console.log('Temporary audio can play - good sign that decoding works');
+                                
+                                // Second attempt: try decoding again with a FileReader
+                                const fileReader = new FileReader();
+                                fileReader.onload = function() {
+                                    audioContext.decodeAudioData(fileReader.result, function(buffer) {
+                                        const decodingTime = performance.now() - decodeStartTime;
+                                        console.log(`Fallback decode succeeded in ${decodingTime.toFixed(2)}ms`);
+                                        
+                                        // Store for future use
+                                        decodedBuffer = buffer;
+                                        
+                                        // Get adjusted delay accounting for decoding time
+                                        const adjustedDelay = Math.max(0, delay - (decodingTime / 1000));
+                                        
+                                        // Play the decoded audio
+                                        playFromDecodedBuffer(buffer, adjustedDelay);
+                                        
+                                        // Report our decoding time
+                                        if (socket && socket.readyState === WebSocket.OPEN) {
+                                            socket.send(JSON.stringify({
+                                                type: 'decoding-stats',
+                                                clientId: getClientId(),
+                                                decodingTime: decodingTime,
+                                                fileSize: bufferCopy.byteLength
+                                            }));
+                                        }
+                                    }, function(err) {
+                                        console.error('Fallback decode also failed:', err);
+                                        handleDecodedBuffer(null);
+                                    });
+                                };
+                                fileReader.readAsArrayBuffer(blob);
+                                
+                                try {
+                                    // Try to use the audio as a MediaElementSource
+                                    const source = audioContext.createMediaElementSource(tempAudio);
+                                    source.connect(gainNode);
+                                    
+                                    // Calculate when to play
+                                    if (delay > 0) {
+                                        console.log(`Scheduling MediaElement with ${delay.toFixed(3)}s delay`);
+                                        setTimeout(function() {
+                                            tempAudio.play().then(() => {
+                                                console.log('MediaElement playback started with delay');
+                                                isPlaying = true;
+                                                audioSource = {
+                                                    isMediaElement: true,
+                                                    element: tempAudio,
+                                                    stop: function() { tempAudio.pause(); }
+                                                };
+                                                
+                                                // Start visualizer
+                                                drawVisualizer();
+                                            }).catch(e => {
+                                                console.error('Error playing with delay:', e);
+                                                // Try immediate playback as last resort
+                                                tempAudio.play().catch(err => {
+                                                    console.error('Also failed immediate play:', err);
+                                                    // Final fallback
+                                                    playWithAudioElement(bufferCopy);
+                                                });
+                                            });
+                                        }, delay * 1000);
+                                    } else {
+                                        // Immediate playback
+                                        tempAudio.currentTime = Math.abs(delay); // Skip ahead if needed
+                                        tempAudio.play().then(() => {
+                                            console.log('MediaElement playback started immediately');
+                                            isPlaying = true;
+                                            audioSource = {
+                                                isMediaElement: true,
+                                                element: tempAudio,
+                                                stop: function() { tempAudio.pause(); }
+                                            };
+                                            
+                                            // Start visualizer
+                                            drawVisualizer();
+                                        }).catch(e => {
+                                            console.error('Error in immediate MediaElement play:', e);
+                                            // Final fallback
+                                            playWithAudioElement(bufferCopy);
+                                        });
+                                    }
+                                } catch (e) {
+                                    console.error('Error creating MediaElementSource:', e);
+                                    // Final fallback to standard Audio element
+                                    playWithAudioElement(bufferCopy);
+                                }
+                            };
+                            
+                            tempAudio.onerror = function() {
+                                console.error('Temp audio element error');
+                                // Final fallback
+                                playWithAudioElement(bufferCopy);
+                            };
+                        } catch (e) {
+                            console.error('Error in blob-based fallback:', e);
+                            // Ultimate fallback
+                            playWithAudioElement(bufferCopy);
+                        }
+                    });
+                } catch (decodeError) {
+                    console.error('Error initiating decode:', decodeError);
+                    // Fallback to audio element directly
+                    playWithAudioElement(bufferCopy);
+                }
+            } catch (e) {
+                console.error('Error processing base64 data:', e);
+                // Try a test tone as last resort
+                playTestTone();
+            }
+        }
+        
+        // Handle the decoded buffer (success or failure)
+        function handleDecodedBuffer(buffer, delay = 0) {
+            if (buffer) {
+                // Success - play using the decoded buffer
+                playFromDecodedBuffer(buffer, delay);
+            } else {
+                // Failure - try HTML Audio element
+                console.error('Failed to decode audio, using HTML Audio fallback');
+                
+                // Create a buffer from the pendingAudioData
+                try {
+                    const binaryString = atob(pendingAudioData);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+                    
+                    playWithAudioElement(bytes.buffer.slice(0));
+                } catch (e) {
+                    console.error('Critical error in audio playback:', e);
+                    syncInfo.textContent = 'Audio playback failed';
+                }
+            }
+        }
+        
+        // Play from pre-decoded buffer for instant playback
+        function playFromDecodedBuffer(buffer, delay = 0) {
+            console.log('playFromDecodedBuffer called with buffer:', 
+                buffer ? `Valid buffer (${buffer.duration.toFixed(2)}s, ${buffer.numberOfChannels} channels)` : 'NULL buffer');
+                
+            if (!buffer) {
+                console.error('Attempted to play with a null buffer!');
+                return;
+            }
+            
+            // Save when we're starting playback (for drift correction)
+            playbackStartTime = Date.now();
+            playbackPosition = 0;
+            driftCorrection = 0;
+            
+            try {
                 // Create a source node from the buffer
                 const source = audioContext.createBufferSource();
                 source.buffer = buffer;
@@ -765,42 +1776,194 @@
                 if (delay > 0) {
                     // Future start time
                     startTime = audioContext.currentTime + delay;
+                    console.log(`Starting with future time: ${startTime.toFixed(3)}, delay: ${delay.toFixed(3)}s`);
                     source.start(startTime);
                 } else {
-                    // Start immediately but skip into the buffer
+                    // For negative delay (we're late), skip ahead in the audio
                     startTime = audioContext.currentTime;
+                    console.log(`Starting with negative delay: ${delay.toFixed(3)}s, skipping to ${Math.abs(delay).toFixed(3)}s`);
                     source.start(startTime, Math.abs(delay));
                 }
                 
-                console.log(`Audio playback scheduled: currentTime=${audioContext.currentTime.toFixed(3)}, startTime=${startTime.toFixed(3)}, delay=${delay.toFixed(3)}`);
+                source.startTime = startTime; // Save the start time for drift calculations
+                
+                console.log(`Pre-decoded audio playback: currentTime=${audioContext.currentTime.toFixed(3)}, startTime=${startTime.toFixed(3)}, delay=${delay.toFixed(3)}`);
                 
                 audioSource = source;
                 isPlaying = true;
+                
+                // Start drift monitoring
+                startDriftMonitoring(buffer.duration);
                 
                 // Start visualizer
                 drawVisualizer();
                 
                 // Handle when playback ends
                 source.onended = function() {
+                    console.log('Audio playback ended naturally');
                     stopAudio();
                 };
-            }, function(error) {
-                console.error('Error decoding audio data:', error);
-                playTestTone(); // Fallback to test tone
-            });
+            } catch (error) {
+                console.error('Error in playFromDecodedBuffer:', error);
+                // Try fallback to regular playback
+                if (audioArrayBuffer && isHost) {
+                    console.log('Trying fallback to HTML Audio element');
+                    playWithAudioElement(audioArrayBuffer);
+                }
+            }
+        }
+        
+        // Start monitoring for playback drift
+        function startDriftMonitoring(duration) {
+            // Clear any existing monitoring
+            if (syncCheckInterval) {
+                clearInterval(syncCheckInterval);
+            }
+            
+            // Check every second for drift
+            syncCheckInterval = setInterval(() => {
+                if (!isPlaying) {
+                    clearInterval(syncCheckInterval);
+                    syncCheckInterval = null;
+                    return;
+                }
+                
+                // Calculate expected playback position based on time elapsed
+                const elapsedMs = Date.now() - playbackStartTime;
+                const expectedPosition = elapsedMs / 1000;
+                
+                // Get actual playback position from audio context
+                const actualPosition = audioContext.currentTime - audioSource.startTime;
+                
+                // Calculate drift (positive means we're ahead, negative means we're behind)
+                const drift = actualPosition - expectedPosition;
+                
+                // Update playback position for UI
+                playbackPosition = actualPosition;
+                
+                // Log significant drift
+                if (Math.abs(drift) > 0.05) { // More than 50ms drift
+                    console.log(`Playback drift detected: ${drift.toFixed(3)}s (expected: ${expectedPosition.toFixed(2)}s, actual: ${actualPosition.toFixed(2)}s)`);
+                    
+                    // If we detect significant drift, we can make a correction
+                    if (Math.abs(drift) > 0.2) { // More than 200ms drift
+                        correctDrift(drift);
+                    }
+                    
+                    // Update calibration info with drift
+                    calibrationInfo.textContent = `Sync offset: ${Math.round(clockOffset)}ms, Network: ${Math.round(networkLatency)}ms, Audio: ${Math.round(audioLatency)}ms, Drift: ${Math.round(drift*1000)}ms`;
+                }
+                
+                // If we're near the end of the track, clear the interval
+                if (actualPosition >= duration - 1) {
+                    clearInterval(syncCheckInterval);
+                    syncCheckInterval = null;
+                }
+            }, 1000);
+        }
+        
+        // Correct playback drift
+        function correctDrift(drift) {
+            if (!isPlaying || !audioSource) return;
+            
+            // For significant drift, we need to take action
+            console.warn(`Attempting to correct ${drift.toFixed(3)}s drift`);
+            
+            try {
+                // If drift is minor (under 0.3s), use playbackRate to gradually correct
+                if (Math.abs(drift) < 0.3 && audioSource.playbackRate !== undefined) {
+                    // Use playback rate to gradually correct
+                    if (drift > 0) {
+                        // We're ahead, slow down playback (between 0.9 and 0.98)
+                        const newRate = 1.0 - Math.min(0.1, drift / 3);
+                        audioSource.playbackRate.value = newRate;
+                        console.log(`Adjusting playback rate to ${newRate.toFixed(2)} to correct drift`);
+                        
+                        // Reset to normal speed after a correction period
+                        setTimeout(() => {
+                            if (audioSource && audioSource.playbackRate) {
+                                audioSource.playbackRate.value = 1.0;
+                                console.log('Resetting playback rate to normal');
+                            }
+                        }, Math.abs(drift) * 3000); // Correction period proportional to drift
+                    } else {
+                        // We're behind, speed up playback (between 1.02 and 1.1)
+                        const newRate = 1.0 + Math.min(0.1, Math.abs(drift) / 3);
+                        audioSource.playbackRate.value = newRate;
+                        console.log(`Adjusting playback rate to ${newRate.toFixed(2)} to correct drift`);
+                        
+                        // Reset to normal speed after a correction period
+                        setTimeout(() => {
+                            if (audioSource && audioSource.playbackRate) {
+                                audioSource.playbackRate.value = 1.0;
+                                console.log('Resetting playback rate to normal');
+                            }
+                        }, Math.abs(drift) * 3000); // Correction period proportional to drift
+                    }
+                }
+                // For major drift, restart with the correct position
+                else if (Math.abs(drift) > 0.3 && audioSource.buffer) {
+                    const currentBuffer = audioSource.buffer;
+                    const currentPos = playbackPosition;
+                    
+                    // Stop current playback
+                    audioSource.stop();
+                    
+                    // Create a new source
+                    const newSource = audioContext.createBufferSource();
+                    newSource.buffer = currentBuffer;
+                    newSource.connect(gainNode);
+                    
+                    // Start at the corrected position
+                    newSource.start(0, currentPos - drift);
+                    
+                    // Replace the audio source
+                    audioSource = newSource;
+                    driftCorrection += drift;
+                    
+                    // Reset playback start time to maintain accurate drift calculation
+                    playbackStartTime = Date.now() - ((currentPos - drift) * 1000);
+                    
+                    console.log(`Restarted playback at corrected position: ${(currentPos - drift).toFixed(3)}s`);
+                }
+            } catch (e) {
+                console.error('Error correcting drift:', e);
+            }
         }
         
         // Stop audio playback
         function stopAudio() {
             if (audioSource) {
                 try {
-                    audioSource.stop();
+                    if (audioSource.isMediaElement) {
+                        audioSource.element.pause();
+                    } else {
+                        audioSource.stop();
+                    }
                 } catch (e) {
-                    // Already stopped
+                    console.error('Error stopping audio source:', e);
+                    // Already stopped or error
                 }
                 audioSource = null;
             }
+            
+            // Also stop any fallback audio element
+            if (audioElementFallback) {
+                try {
+                    audioElementFallback.pause();
+                    audioElementFallback.currentTime = 0;
+                } catch (e) {
+                    // Ignore errors
+                }
+            }
+            
             isPlaying = false;
+            
+            // Clear drift monitoring
+            if (syncCheckInterval) {
+                clearInterval(syncCheckInterval);
+                syncCheckInterval = null;
+            }
         }
         
         // Draw audio visualizer
@@ -844,6 +2007,129 @@
             return btoa(binary.join(''));
         }
         
+        // Pre-decode audio from base64 string
+        function preDecodeAudio(base64Data) {
+            if (!audioContext) {
+                initAudio();
+            }
+            
+            // Start timing
+            const decodeStartTime = performance.now();
+            
+            try {
+                // Convert base64 to array buffer
+                const binaryString = atob(base64Data);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                
+                const arrayBuffer = bytes.buffer;
+                console.log(`Pre-decode: Created array buffer of size ${arrayBuffer.byteLength} bytes`);
+                
+                // Try to decode the audio data
+                audioContext.decodeAudioData(arrayBuffer, function(buffer) {
+                    decodedBuffer = buffer; // Store for later use
+                    
+                    const decodingTime = performance.now() - decodeStartTime;
+                    console.log(`Pre-decoded audio in ${decodingTime.toFixed(2)}ms, duration: ${buffer.duration.toFixed(2)}s`);
+                    
+                    // Report our decoding time to the server
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({
+                            type: 'decoding-stats',
+                            clientId: getClientId(),
+                            decodingTime: decodingTime,
+                            fileSize: arrayBuffer.byteLength
+                        }));
+                    }
+                }, function(error) {
+                    console.error('Error pre-decoding audio:', error);
+                    
+                    // Try fallback method
+                    try {
+                        const blob = new Blob([arrayBuffer], {type: 'audio/mp3'});
+                        const fileReader = new FileReader();
+                        fileReader.onload = function() {
+                            audioContext.decodeAudioData(fileReader.result, function(buffer) {
+                                decodedBuffer = buffer;
+                                console.log('Successfully decoded using Blob method');
+                                
+                                const decodingTime = performance.now() - decodeStartTime;
+                                if (socket && socket.readyState === WebSocket.OPEN) {
+                                    socket.send(JSON.stringify({
+                                        type: 'decoding-stats',
+                                        clientId: getClientId(),
+                                        decodingTime: decodingTime,
+                                        fileSize: arrayBuffer.byteLength
+                                    }));
+                                }
+                            });
+                        };
+                        fileReader.readAsArrayBuffer(blob);
+                    } catch (e) {
+                        console.error('Error with fallback decode method:', e);
+                    }
+                });
+            } catch (error) {
+                console.error('Error in preDecodeAudio:', error);
+            }
+        }
+        
+        // Fallback to standard HTML Audio element
+        function playWithAudioElement(arrayBuffer) {
+            console.log('Attempting playback with HTML Audio element');
+            
+            try {
+                // Clean up any existing player
+                if (audioElementFallback) {
+                    audioElementFallback.pause();
+                    audioElementFallback.src = '';
+                }
+                
+                // Create a blob from the array buffer
+                const blob = new Blob([arrayBuffer], { type: 'audio/mp3' });
+                const url = URL.createObjectURL(blob);
+                
+                // Create and configure the audio element
+                audioElementFallback = new Audio(url);
+                audioElementFallback.volume = volumeSlider.value;
+                
+                // Play when ready
+                audioElementFallback.oncanplaythrough = function() {
+                    console.log('Audio element ready to play');
+                    audioElementFallback.play()
+                        .then(() => {
+                            console.log('Audio element playback started');
+                            isPlaying = true;
+                            
+                            // Show playback info
+                            syncInfo.textContent = 'Playing audio (fallback mode)';
+                            
+                            // Start visualizer (even though it won't work with audio element)
+                            drawVisualizer();
+                        })
+                        .catch(err => console.error('Error playing with audio element:', err));
+                };
+                
+                // Handle errors
+                audioElementFallback.onerror = function(e) {
+                    console.error('Audio element error:', e);
+                    syncInfo.textContent = 'Audio playback failed';
+                };
+                
+                // Handle playback end
+                audioElementFallback.onended = function() {
+                    console.log('Audio element playback ended');
+                    isPlaying = false;
+                    syncInfo.textContent = 'Playback complete';
+                };
+            } catch (error) {
+                console.error('Error in audio element fallback:', error);
+                syncInfo.textContent = 'Critical audio error';
+            }
+        }
+        
         // Event listeners
         hostBtn.addEventListener('click', () => {
             if (initAudio()) {
@@ -871,43 +2157,82 @@
         });
         
         playBtn.addEventListener('click', () => {
-            if (!isHost || !socket || !audioArrayBuffer) return;
+            if (!isHost || !socket || !audioArrayBuffer || preloadInProgress) return;
             
-            // Convert the audio file to a base64 string
-            const base64Data = arrayBufferToBase64(audioArrayBuffer);
+            if (!decodedBuffer) {
+                syncInfo.textContent = 'Error: Audio not properly prepared';
+                return;
+            }
             
-            // Schedule playback 3 seconds in the future to allow for transmission time
-            // This gives clients time to receive and decode the audio before playback
-            const scheduledTime = Date.now() + 3000;
+            // Show that we're preparing
+            syncInfo.textContent = 'Preparing for synchronized playback...';
+            playBtn.disabled = true; // Disable to prevent double-clicks
             
-            // Send the MP3 data to all clients
-            const message = {
-                type: 'play',
-                mp3Data: base64Data,
-                scheduledTime: scheduledTime,
-                serverTime: Date.now()
-            };
-            
-            // Show upload progress
-            uploadProgress.style.display = 'block';
-            progressFill.style.width = '0%';
-            progressText.textContent = '0%';
-            
-            // Send the message
-            socket.send(JSON.stringify(message));
-            
-            // Update progress immediately for demo
-            progressFill.style.width = '100%';
-            progressText.textContent = '100%';
-            
-            // Play on host device with the scheduled delay
-            const delaySeconds = (scheduledTime - Date.now()) / 1000;
-            playMP3FromBase64(base64Data, delaySeconds);
-            
-            // Hide progress bar after a delay
-            setTimeout(() => {
+            try {
+                // Convert the audio file to a base64 string
+                const base64Data = arrayBufferToBase64(audioArrayBuffer);
+                
+                // First, send decoding information to help clients prepare
+                socket.send(JSON.stringify({
+                    type: 'prepare-audio',
+                    fileSize: audioArrayBuffer.byteLength,
+                    duration: decodedBuffer.duration,
+                    sampleRate: decodedBuffer.sampleRate,
+                    numberOfChannels: decodedBuffer.numberOfChannels,
+                    serverTime: Date.now()
+                }));
+                
+                console.log('Sent prepare-audio message, sending play command in 2 seconds');
+                
+                // Show upload progress
+                uploadProgress.style.display = 'block';
+                progressFill.style.width = '0%';
+                progressText.textContent = '0%';
+                
+                // Simulate progress while clients prepare
+                let progress = 0;
+                const progressInterval = setInterval(() => {
+                    progress += 5;
+                    if (progress > 90) {
+                        clearInterval(progressInterval);
+                    }
+                    progressFill.style.width = `${progress}%`;
+                    progressText.textContent = `${progress}%`;
+                }, 100);
+                
+                // Give clients a moment to process the preparation message
+                setTimeout(() => {
+                    // Then send the actual audio data
+                    socket.send(JSON.stringify({
+                        type: 'play',
+                        mp3Data: base64Data,
+                        audioInfo: {
+                            duration: decodedBuffer.duration,
+                            sampleRate: decodedBuffer.sampleRate,
+                            channels: decodedBuffer.numberOfChannels
+                        }
+                    }));
+                    
+                    console.log('Sent audio data for synchronized playback');
+                    
+                    // Complete the progress bar
+                    clearInterval(progressInterval);
+                    progressFill.style.width = '100%';
+                    progressText.textContent = '100%';
+                    
+                    // Hide progress bar after a delay
+                    setTimeout(() => {
+                        uploadProgress.style.display = 'none';
+                        // Re-enable button after sending
+                        playBtn.disabled = false;
+                    }, 1000);
+                }, 2000);
+            } catch (error) {
+                console.error('Error sending audio data:', error);
+                syncInfo.textContent = 'Error sending audio data. Try again.';
                 uploadProgress.style.display = 'none';
-            }, 1000);
+                playBtn.disabled = false;
+            }
         });
         
         stopBtn.addEventListener('click', () => {
@@ -919,22 +2244,6 @@
             
             socket.send(JSON.stringify(message));
             stopAudio();
-        });
-        
-        audioFileInput.addEventListener('change', (event) => {
-            const file = event.target.files[0];
-            if (file) {
-                selectedFile.textContent = file.name;
-                
-                // Read the file as an ArrayBuffer
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    audioArrayBuffer = e.target.result;
-                    playBtn.disabled = false;
-                    stopBtn.disabled = false;
-                };
-                reader.readAsArrayBuffer(file);
-            }
         });
         
         volumeSlider.addEventListener('input', () => {

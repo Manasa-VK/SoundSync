@@ -23,15 +23,34 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// Create WebSocket server with increased message size limit for MP3 files
+// Increase WebSocket server limits substantially for large audio files
 const wss = new WebSocket.Server({ 
   server, 
-  maxPayload: 50 * 1024 * 1024  // 50MB max payload size
+  maxPayload: 200 * 1024 * 1024,  // 200MB max payload size
+  perMessageDeflate: {
+    zlibDeflateOptions: {
+      level: 5  // Compression level (1-9, where 9 is highest but slowest)
+    }
+  }
 });
+
+// Helper for getting a reasonable size string
+function getSizeString(bytes) {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 // Keep track of all connected clients
 const clients = new Set();
 let hostClient = null;
+let readyClients = new Map(); // Track which clients are ready for synchronized playback
+let activePlayback = null;   // Track active playback session
+let syncCheckTimer = null;   // Timer for periodic sync checks
+let clientDecodingTimes = new Map(); // Track client audio decoding performance
+
+// Store MP3 data separately to avoid issues with large messages
+let currentMP3Data = null;
 
 // Handle WebSocket connections
 wss.on('connection', (ws) => {
@@ -98,26 +117,271 @@ wss.on('connection', (ws) => {
           }));
           break;
           
+        case 'prepare-audio':
+          // Host is sending audio preparation info for clients
+          console.log('Received audio preparation info');
+          
+          // Forward to all clients to help them prepare
+          broadcastToClients(JSON.stringify({
+            type: 'prepare-audio',
+            fileSize: data.fileSize,
+            duration: data.duration,
+            sampleRate: data.sampleRate,
+            numberOfChannels: data.numberOfChannels,
+            serverTime: Date.now()
+          }), true);
+          break;
+          
+        case 'decoding-stats':
+          // Client is reporting its audio decoding performance
+          if (data.clientId) {
+            // Store the client's decoding performance
+            clientDecodingTimes.set(data.clientId, {
+              decodingTime: data.decodingTime,
+              timestamp: Date.now()
+            });
+            
+            console.log(`Client ${data.clientId} reported decoding time: ${data.decodingTime}ms for ${data.fileSize} bytes`);
+          }
+          break;
+          
         case 'play':
           // Add server timestamp for synchronization
           data.serverTime = Date.now();
           
+          // Start a new sync verification for this playback
+          readyClients.clear();
+          clientDecodingTimes.clear();
+          
+          // Create a unique playback ID
+          const playbackId = Date.now().toString();
+          
           // Log MP3 data size if present
           if (data.mp3Data) {
-            const sizeInMB = (data.mp3Data.length * 0.75) / (1024 * 1024);
+            // Store the MP3 data securely
+            currentMP3Data = data.mp3Data;
+            
+            const mp3DataSize = data.mp3Data.length * 0.75; // Base64 to binary size approx
+            const sizeInMB = mp3DataSize / (1024 * 1024);
             console.log(`Broadcasting audio file (${sizeInMB.toFixed(2)}MB)`);
+            
+            // Verify the data looks valid (sanity check)
+            if (data.mp3Data.length < 100) {
+              console.error('MP3 data appears to be invalid or too small:', data.mp3Data);
+            } else {
+              console.log('MP3 data appears valid (first 20 chars):', data.mp3Data.substring(0, 20) + '...');
+            }
+            
+            // Clone the data object without the MP3 data for easier manipulation
+            const playCommandBase = {
+              type: data.type,
+              serverTime: data.serverTime,
+              audioInfo: data.audioInfo,
+              playbackId: playbackId
+            };
+            
+            // Set a longer scheduled time for precise sync (8 seconds for MP3 files)
+            // This gives enough time for large files to be transferred and decoded
+            playCommandBase.scheduledTime = Date.now() + 8000;
+            
+            // First, send a sync verification request to all clients
+            broadcastToClients(JSON.stringify({
+              type: 'sync-verification',
+              playId: playbackId,
+              serverTime: Date.now(),
+              audioInfo: data.audioInfo // Forward audio info from host
+            }), true);
+            
+            // Store information about this playback session
+            activePlayback = {
+              id: playbackId,
+              startTime: playCommandBase.scheduledTime,
+              clientSyncStates: new Map(),
+              startedAt: null,
+              audioInfo: data.audioInfo
+            };
+            
+            // Then wait for all clients to confirm they're synced before sending play command
+            setTimeout(() => {
+              if (clients.size > 1) { // If we have clients besides the host
+                console.log(`Waiting for clients to confirm sync readiness (${readyClients.size}/${clients.size - 1} ready)`);
+                
+                // Wait for clients to be ready or timeout
+                const waitForSync = setInterval(() => {
+                  const readyCount = readyClients.size;
+                  const clientCount = clients.size - 1; // Exclude host
+                  
+                  console.log(`Sync status: ${readyCount}/${clientCount} clients ready`);
+                  
+                  // Proceed if all clients are ready or we're getting close to scheduled time
+                  if (readyCount >= clientCount || Date.now() > playCommandBase.scheduledTime - 2000) {
+                    clearInterval(waitForSync);
+                    
+                    // Check if we need to adjust the scheduled time based on client decoding performance
+                    if (clientDecodingTimes.size > 0) {
+                      // Find the slowest client's decoding time
+                      let maxDecodingTime = 0;
+                      for (const [clientId, stats] of clientDecodingTimes.entries()) {
+                        maxDecodingTime = Math.max(maxDecodingTime, stats.decodingTime);
+                      }
+                      
+                      // If any client takes more than 2 seconds to decode, add extra buffer
+                      if (maxDecodingTime > 2000) {
+                        const additionalBuffer = Math.min(3000, maxDecodingTime - 2000);
+                        playCommandBase.scheduledTime += additionalBuffer;
+                        console.log(`Adjusted scheduled time by +${additionalBuffer}ms due to slow decoding`);
+                      }
+                    }
+                    
+                    console.log(`Broadcasting play command (${readyCount}/${clientCount} clients synchronized) for time ${new Date(playCommandBase.scheduledTime).toISOString()}`);
+                    
+                    // Set the actual start time for tracking
+                    activePlayback.startTime = playCommandBase.scheduledTime;
+                    activePlayback.startedAt = Date.now();
+                    
+                    // Make sure we still have the MP3 data
+                    if (!currentMP3Data || currentMP3Data.length < 100) {
+                      console.error('ERROR: MP3 data was lost during processing!');
+                      return;
+                    }
+                    
+                    // Add the MP3 data to the play command
+                    const fullPlayCommand = {
+                      ...playCommandBase,
+                      mp3Data: currentMP3Data
+                    };
+                    
+                    // Send the play command to clients
+                    const playCommandJson = JSON.stringify(fullPlayCommand);
+                    console.log('Play command JSON size:', getSizeString(playCommandJson.length));
+                    
+                    // Send to each client individually to ensure reliability
+                    for (const client of clients) {
+                      if (client.readyState === WebSocket.OPEN && !client.isHost) {
+                        try {
+                          client.send(playCommandJson, (err) => {
+                            if (err) {
+                              console.error('Error sending play command to client:', err.message);
+                            } else {
+                              console.log('Play command sent to client successfully');
+                            }
+                          });
+                        } catch (error) {
+                          console.error('Error sending play command:', error);
+                        }
+                      }
+                    }
+                    
+                    // Also send playback command to host (without the MP3 data)
+                    // Important: Don't send the MP3 data back to the host (it already has it)
+                    if (hostClient && hostClient.readyState === WebSocket.OPEN) {
+                      hostClient.send(JSON.stringify({
+                        type: 'host-play',
+                        scheduledTime: playCommandBase.scheduledTime,
+                        playbackId: playbackId,
+                        serverTime: Date.now()
+                      }));
+                    }
+                    
+                    // If some clients aren't ready, send them individually adjusted times
+                    if (readyCount < clientCount) {
+                      console.log(`Warning: Not all clients confirmed sync readiness`);
+                    }
+                    
+                    // Set up periodic sync checks during playback
+                    startPeriodicSyncChecks();
+                  }
+                }, 500); // Check every 500ms
+              } else {
+                // No clients to wait for, broadcast immediately
+                console.log('No clients to sync with, playing immediately');
+                
+                // Set the actual start time for tracking
+                activePlayback.startedAt = Date.now();
+                
+                // Direct host to play
+                if (hostClient && hostClient.readyState === WebSocket.OPEN) {
+                  hostClient.send(JSON.stringify({
+                    type: 'host-play',
+                    scheduledTime: playCommandBase.scheduledTime,
+                    playbackId: playbackId,
+                    serverTime: Date.now()
+                  }));
+                }
+              }
+            }, 200); // Small delay to allow sync-verification to be sent first
           } else {
+            // For test tones, use a much shorter schedule time
+            data.scheduledTime = Date.now() + 1000;
             console.log('Broadcasting test sound');
+            broadcastToClients(JSON.stringify(data), true);
           }
+          break;
           
-          // Broadcast the play command to all clients except the host
-          broadcastToClients(JSON.stringify(data), true);
+        case 'client-ready':
+          // Client is reporting it's ready for synchronized playback
+          if (data.clientId && data.syncInfo) {
+            // Store the client's readiness and sync information
+            readyClients.set(data.clientId, {
+              timestamp: Date.now(),
+              networkLatency: data.syncInfo.networkLatency,
+              clockOffset: data.syncInfo.clockOffset,
+              audioLatency: data.syncInfo.audioLatency
+            });
+            
+            // Also store in active playback if available
+            if (activePlayback && data.playId === activePlayback.id) {
+              activePlayback.clientSyncStates.set(data.clientId, {
+                lastUpdate: Date.now(),
+                syncInfo: data.syncInfo
+              });
+            }
+            
+            console.log(`Client ${data.clientId} reported ready for sync playback (${readyClients.size} ready)`);
+            
+            // Notify the host about client readiness
+            if (hostClient && hostClient.readyState === WebSocket.OPEN) {
+              hostClient.send(JSON.stringify({
+                type: 'client-sync-status',
+                clientId: data.clientId,
+                ready: true,
+                readyCount: readyClients.size,
+                totalClients: clients.size - 1
+              }));
+            }
+          }
+          break;
+          
+        case 'playback-status':
+          // Client is reporting its playback status
+          if (data.clientId && data.playbackId && activePlayback && data.playbackId === activePlayback.id) {
+            // Update the client's playback status
+            activePlayback.clientSyncStates.set(data.clientId, {
+              lastUpdate: Date.now(),
+              position: data.position,
+              drift: data.drift,
+              syncInfo: data.syncInfo
+            });
+            
+            // Log significant drift
+            if (Math.abs(data.drift) > 0.1) {
+              console.log(`Client ${data.clientId} reported drift of ${data.drift.toFixed(3)}s at position ${data.position.toFixed(2)}s`);
+            }
+          }
           break;
           
         case 'stop':
           // Broadcast the stop command to all clients except the host
           broadcastToClients(JSON.stringify(data), true);
           console.log('Broadcasting stop command');
+          
+          // Clear active playback and sync check timer
+          activePlayback = null;
+          currentMP3Data = null;
+          if (syncCheckTimer) {
+            clearTimeout(syncCheckTimer);
+            syncCheckTimer = null;
+          }
           break;
           
         case 'clock-sync':
@@ -199,6 +463,81 @@ function broadcastToClients(message, skipHost = false) {
       client.send(message);
     }
   });
+}
+
+// Periodic sync checks during playback
+function startPeriodicSyncChecks() {
+  // Clear any existing timer
+  if (syncCheckTimer) {
+    clearTimeout(syncCheckTimer);
+  }
+  
+  // Check sync every 5 seconds
+  syncCheckTimer = setTimeout(checkPlaybackSync, 5000);
+}
+
+// Check playback synchronization across clients
+function checkPlaybackSync() {
+  if (!activePlayback || !activePlayback.startedAt) {
+    // No active playback or it hasn't started yet
+    return;
+  }
+  
+  // Calculate expected playback position
+  const elapsedMs = Date.now() - activePlayback.startedAt;
+  const expectedPosition = elapsedMs / 1000;
+  
+  // Request status update from all clients
+  broadcastToClients(JSON.stringify({
+    type: 'request-playback-status',
+    playbackId: activePlayback.id,
+    expectedPosition: expectedPosition,
+    serverTime: Date.now()
+  }), true);
+  
+  // Wait for responses and send drift corrections if needed
+  setTimeout(() => {
+    if (!activePlayback) return;
+    
+    // Analyze client states and find average drift
+    let totalDrift = 0;
+    let clientCount = 0;
+    let maxDrift = 0;
+    let minDrift = 0;
+    
+    for (const [clientId, state] of activePlayback.clientSyncStates.entries()) {
+      if (state.drift !== undefined) {
+        totalDrift += state.drift;
+        clientCount++;
+        maxDrift = Math.max(maxDrift, state.drift);
+        minDrift = Math.min(minDrift, state.drift);
+      }
+    }
+    
+    // Only process if we have client data
+    if (clientCount > 0) {
+      const avgDrift = totalDrift / clientCount;
+      const driftSpread = maxDrift - minDrift;
+      
+      console.log(`Playback sync status: avg drift=${avgDrift.toFixed(3)}s, spread=${driftSpread.toFixed(3)}s across ${clientCount} clients`);
+      
+      // If average drift is significant or the spread is too large, send correction
+      if (Math.abs(avgDrift) > 0.1 || driftSpread > 0.2) {
+        console.log('Sending drift correction command');
+        
+        broadcastToClients(JSON.stringify({
+          type: 'drift-correction',
+          playbackId: activePlayback.id,
+          avgDrift: avgDrift,
+          expectedPosition: expectedPosition,
+          serverTime: Date.now()
+        }), true);
+      }
+    }
+    
+    // Schedule next check
+    syncCheckTimer = setTimeout(checkPlaybackSync, 5000);
+  }, 1000); // Wait 1 second for responses
 }
 
 // Start the server
